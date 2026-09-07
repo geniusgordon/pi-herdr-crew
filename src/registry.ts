@@ -31,7 +31,7 @@ export type Member = {
   adopted?: boolean;
   /** Current task id. It names the directory under .pi/crew. */
   task?: string;
-  /** Completed ask calls for the current task. It numbers the brief and result files. */
+  /** Turn number of the newest ask, for display. Disk, not this field, numbers the files. */
   turns?: number;
   /** Absolute path of the newest result file, for action "result". */
   lastResult?: string;

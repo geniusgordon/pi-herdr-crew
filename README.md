@@ -15,13 +15,13 @@ still dumps its whole answer into the parent.
 The file protocol bounds it. The parent writes a brief, the member writes a result
 file, and the member replies with one summary line.
 
-Measured on one audit of a 6-line file, where the member produced 15942 bytes:
+Measured on one audit of this repository, where the member produced 12283 bytes:
 
 | Read path | Bytes the parent consumes |
 |---|---|
-| `herdr agent read` | 15942 plus terminal noise |
-| child session JSONL | 15942 |
-| file protocol | 167 plus a section list |
+| `herdr agent read` | 12283 plus terminal noise |
+| child session JSONL | 12283 |
+| file protocol | 124 plus a section list |
 
 ## Split of duty
 
@@ -61,7 +61,7 @@ pi remove git:github.com/geniusgordon/pi-herdr-crew
 A local checkout installs from its path:
 
 ```bash
-pi install /path/to/pi-herdr
+pi install /path/to/pi-herdr-crew
 ```
 
 ## The `crew` tool

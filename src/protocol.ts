@@ -2,7 +2,7 @@
  * The file protocol.
  *
  * A member answer must not enter the parent context whole. Measured on one audit
- * of a 6-line file, the child produced 8256 bytes of markdown. Reading that
+ * of this repository, the member produced 12283 bytes of markdown. Reading that
  * from the child session file is clean next to the terminal, but it is not
  * small.
  *
@@ -11,7 +11,7 @@
  *   2. The member reads that brief and writes a result file.
  *   3. The member replies with one summary line.
  *
- * The same audit then cost the parent 26 bytes, a 317x reduction.
+ * The same audit then cost the parent a 124 byte reply line, a 99x reduction.
  */
 
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
@@ -191,6 +191,28 @@ export async function inspectResult(path: string, orchestratorCwd: string): Prom
     .slice(0, 40);
 
   return info;
+}
+
+/**
+ * The next free turn number for a task.
+ *
+ * Disk owns the turn count, not the member record. A member that runs task A,
+ * then task B, then task A again would restart at turn 1 from its own counter
+ * and overwrite the first pair of files. Scanning the directory cannot, and it
+ * also survives a parent that adopted the member with no memory.
+ */
+export async function nextTurn(orchestratorCwd: string, task: string): Promise<number> {
+  const dir = join(orchestratorCwd, CREW_ROOT, task);
+  const names = await readdir(dir).catch(() => [] as string[]);
+
+  let highest = 0;
+  for (const name of names) {
+    const match = name.match(/^(?:brief|result)(?:-(\d+))?\.md$/);
+    if (!match) continue;
+    highest = Math.max(highest, match[1] ? Number(match[1]) : 1);
+  }
+
+  return highest + 1;
 }
 
 /**

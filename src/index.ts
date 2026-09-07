@@ -14,7 +14,7 @@
  * the raw terminal, which carries the startup banner, the skill list, and the
  * token bar. Reading the child session file removes that noise but does not
  * bound the size. So a member writes markdown to disk and replies with one
- * summary line. Measured on a 15942 byte audit, this context took 167 bytes.
+ * summary line. Measured on a 12283 byte audit, this context took 124 bytes.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -37,6 +37,7 @@ import {
   findLatestResult,
   inspectResult,
   listTaskFiles,
+  nextTurn,
   readSection,
   renderBrief,
   renderPrompt,
@@ -419,7 +420,9 @@ export default function (pi: ExtensionAPI) {
     // One directory per task, not per member. A member can run several tasks, and a
     // task can outlive the member that ran it.
     const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
-    const turn = taskId === member.task ? (member.turns ?? 0) + 1 : 1;
+    // Disk owns the turn number. A member that returns to an earlier task_id would
+    // restart at turn 1 from its own counter and overwrite that task's files.
+    const turn = await nextTurn(ctx.cwd, taskId);
     // The orchestrator cwd owns every brief and result. A worktree member runs in
     // a directory that close removes, so a result stored there dies with it.
     const paths = taskPaths(ctx.cwd, taskId, turn);
@@ -514,6 +517,21 @@ export default function (pi: ExtensionAPI) {
     // the old state and return at once. A completed turn appends a turn summary
     // to the child session file, which is an unambiguous signal.
     const outcome = await waitForTurn(member, pending.baseline, timeout, signal, onUpdate);
+
+    // A lost pane is not a slow member, so say so. The task cannot finish.
+    if (outcome.kind === "timeout" && outcome.state === "gone") {
+      return ok(
+        [
+          `Member ${member.name} has no live pane, so task ${taskId} cannot finish.`,
+          `Elapsed: ${Math.round((Date.now() - pending.sentAt) / 1000)}s.`,
+          useFile ? `Read any partial answer with action "result" and task_id ${taskId}.` : "",
+          `Close the member and open a new one.`,
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+        { member: member.name, state: "gone", pending: true },
+      );
+    }
 
     if (outcome.kind === "timeout") {
       return ok(
@@ -620,24 +638,30 @@ export default function (pi: ExtensionAPI) {
   ): Promise<ToolResult> {
     // A task lives in the orchestrator cwd, so it outlives its member. Read a
     // result by task id alone when the member is already closed.
-    let taskId = params.task_id ? slugify(params.task_id) : undefined;
+    const asked = params.task_id ? slugify(params.task_id) : undefined;
     let member: Member | undefined;
 
     if (params.member) {
       member = await resolveMember(params.member, signal);
-      taskId ??= member.task ?? member.name;
     }
+    const taskId = asked ?? member?.task ?? member?.name;
     if (!taskId) {
       throw new Error(`Action "result" needs a member name or a task_id.`);
     }
 
-    const path = member?.lastResult ?? (await findLatestResult(ctx.cwd, taskId));
+    // `lastResult` names the member's current task only. An explicit task_id for
+    // another task must read that task's directory instead.
+    const cached = taskId === (member?.task ?? member?.name) ? member?.lastResult : undefined;
+    const path = cached ?? (await findLatestResult(ctx.cwd, taskId));
     if (!path) {
       throw new Error(
         `No result file in ${CREW_ROOT}/${taskId}. Run action "ask" without inline true first.`,
       );
     }
-    if (member && path !== member.lastResult) persist({ ...member, lastResult: path });
+    // Cache only the member's own current task, or a foreign read poisons it.
+    if (member && taskId === (member.task ?? member.name) && path !== member.lastResult) {
+      persist({ ...member, lastResult: path });
+    }
 
     const info: ResultInfo = await inspectResult(path, ctx.cwd);
     if (!info.exists) throw new Error(`Result file ${info.relative} does not exist.`);
@@ -787,11 +811,16 @@ export default function (pi: ExtensionAPI) {
     if (!open.length) return ok(`No member is open. Use action "open".`);
 
     const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
-    const byPane = new Map<string, any>((live.agents ?? []).map((a: any) => [a.pane_id, a]));
+    // Key by name, not by pane id. A pane move changes the pane id, and a cached
+    // id then reports a live member as gone.
+    const byName = new Map<string, any>(
+      (live.agents ?? []).filter((a: any) => typeof a?.name === "string").map((a: any) => [a.name as string, a]),
+    );
 
     const rows = open.map((member) => {
-      const agent = byPane.get(member.paneId);
+      const agent = byName.get(member.name);
       const state = agent ? String(agent.agent_status) : "gone";
+      const paneId = agent?.pane_id ? String(agent.pane_id) : member.paneId;
       const flag =
         state === "blocked"
           ? " <- needs input"
@@ -802,7 +831,7 @@ export default function (pi: ExtensionAPI) {
               : member.adopted
                 ? " <- adopted"
                 : "";
-      return `${member.name.padEnd(16)} ${state.padEnd(8)} ${member.paneId.padEnd(8)} ${member.worktree?.branch ?? member.cwd}${flag}`;
+      return `${member.name.padEnd(16)} ${state.padEnd(8)} ${paneId.padEnd(8)} ${member.worktree?.branch ?? member.cwd}${flag}`;
     });
 
     refreshStatus(ctx);
@@ -998,7 +1027,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!inHerdr()) {
         throw new Error(
-          "This pi session does not run inside a Herdr pane, so member cannot control panes. Start pi inside Herdr.",
+          "This pi session does not run inside a Herdr pane, so it cannot control panes. Start pi inside Herdr.",
         );
       }
 
