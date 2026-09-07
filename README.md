@@ -36,16 +36,32 @@ Such a dialog exists on screen and never in a file.
 
 Requires pi inside a Herdr pane, so `HERDR_ENV=1`.
 
-Test one run:
-
 ```bash
-pi -e /path/to/pi-herdr/src/index.ts
+pi install git:github.com/geniusgordon/pi-herdr-crew
 ```
 
-Install for every project:
+Try it for one run, with no change to your settings:
 
 ```bash
-ln -s /path/to/pi-herdr/src ~/.pi/agent/extensions/herdr-crew
+pi -e git:github.com/geniusgordon/pi-herdr-crew
+```
+
+Install for one project instead of every project:
+
+```bash
+pi install -l git:github.com/geniusgordon/pi-herdr-crew
+```
+
+Remove it:
+
+```bash
+pi remove git:github.com/geniusgordon/pi-herdr-crew
+```
+
+A local checkout installs from its path:
+
+```bash
+pi install /path/to/pi-herdr
 ```
 
 ## The `crew` tool
