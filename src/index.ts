@@ -84,8 +84,105 @@ export default function (pi: ExtensionAPI) {
 
   // ------------------------------------------------------------------ actions
 
+  /**
+   * Adopt every named Herdr agent that this registry does not know yet.
+   *
+   * Herdr, not this session, owns lane liveness. A lane outlives its parent, so
+   * a new or reloaded parent must find it again. `agent list` already reports
+   * the name, the pane, the cwd, and the session file, which is everything a
+   * clean read needs. A half-finished open leaves the same state behind.
+   */
+  async function adoptLanes(signal?: AbortSignal): Promise<Lane[]> {
+    const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
+    const known = new Set(registry.openNames());
+    const adopted: Lane[] = [];
+
+    for (const agent of live.agents ?? []) {
+      const name = agent?.name;
+      const sessionPath = agent?.agent_session?.value;
+      if (typeof name !== "string" || known.has(name)) continue;
+
+      const lane: Lane = {
+        name,
+        paneId: String(agent.pane_id),
+        workspaceId: String(agent.workspace_id),
+        sessionPath: typeof sessionPath === "string" && sessionPath.startsWith("/") ? sessionPath : "",
+        cwd: String(agent.cwd ?? ""),
+        kind: String(agent.agent ?? "pi"),
+        openedAt: new Date().toISOString(),
+        adopted: true,
+      };
+
+      // A worktree lane sits in its own workspace. Match on that workspace id.
+      if (lane.cwd) {
+        const list = await herdr(exec, ["worktree", "list", "--cwd", lane.cwd], { signal, timeoutMs: 15_000 }).catch(
+          () => undefined,
+        );
+        const match = (list?.worktrees ?? []).find(
+          (wt: any) => wt?.is_linked_worktree && wt?.open_workspace_id === lane.workspaceId,
+        );
+        if (match) {
+          lane.worktree = { path: String(match.path), branch: String(match.branch), workspaceId: lane.workspaceId };
+        }
+      }
+
+      persist(lane);
+      adopted.push(lane);
+    }
+
+    return adopted;
+  }
+
+  /**
+   * Resolve a lane against live Herdr state.
+   *
+   * Never trust the cached pane id or session path. A pane move changes the pane
+   * id, and a lane that started at a dialog reports its session file only after
+   * it reaches its prompt. One `agent get` call keeps both fields current.
+   */
+  async function resolveLane(name: string, signal?: AbortSignal): Promise<Lane> {
+    if (!registry.openNames().includes(name)) await adoptLanes(signal);
+    const lane = registry.get(name);
+
+    const live = await herdr(exec, ["agent", "get", name], { signal, timeoutMs: 10_000 }).catch(() => undefined);
+    const agent = live?.agent;
+    if (!agent) return lane;
+
+    const paneId = typeof agent.pane_id === "string" ? agent.pane_id : lane.paneId;
+    const reported = agent.agent_session?.value;
+    const sessionPath = typeof reported === "string" && reported.startsWith("/") ? reported : lane.sessionPath;
+
+    if (paneId === lane.paneId && sessionPath === lane.sessionPath) return lane;
+
+    const refreshed: Lane = { ...lane, paneId, sessionPath };
+    persist(refreshed);
+    return refreshed;
+  }
+
+  /** Clear a name Herdr still holds after a failed open, instead of deadlocking on it. */
+  async function reconcileName(name: string, signal?: AbortSignal): Promise<string | undefined> {
+    const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
+    const held = (live.agents ?? []).find((agent: any) => agent?.name === name);
+    if (!held) return undefined;
+
+    if (registry.openNames().includes(name)) {
+      throw new Error(`Lane "${name}" is already open in ${held.pane_id}. Use action "ask", or pick another name.`);
+    }
+
+    await herdr(exec, ["pane", "close", held.pane_id], { signal, timeoutMs: 30_000 });
+    return held.pane_id;
+  }
+
   async function openLane(
-    params: { lane: string; cwd?: string; kind?: string; worktree?: boolean; branch?: string; base?: string },
+    params: {
+      lane: string;
+      cwd?: string;
+      kind?: string;
+      worktree?: boolean;
+      branch?: string;
+      base?: string;
+      trust?: boolean;
+    },
     ctx: ExtensionContext,
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
@@ -95,6 +192,9 @@ export default function (pi: ExtensionAPI) {
     if (registry.openNames().includes(name)) {
       throw new Error(`Lane "${name}" is already open. Use action "ask" or pick another name.`);
     }
+
+    const reclaimed = await reconcileName(name, signal);
+    if (reclaimed) onUpdate?.(ok(`Reclaimed the name ${name} from orphan pane ${reclaimed}.`));
 
     const cwd = params.cwd ? (params.cwd.startsWith("/") ? params.cwd : `${ctx.cwd}/${params.cwd}`) : ctx.cwd;
     const kind = params.kind ?? "pi";
@@ -132,31 +232,40 @@ export default function (pi: ExtensionAPI) {
 
     onUpdate?.(ok(`Starting ${kind} in ${paneId}...`));
 
-    let started: any;
+    // A lane must never stop at the project trust dialog. That dialog blocks
+    // startup in every new directory, and a worktree path is always new.
+    // --no-approve ignores project-local files; --approve loads them.
+    const trustFlag = params.trust ? "--approve" : "--no-approve";
+    const childArgs = kind === "pi" ? ["--", "--session-id", `lane-${name}-${id}`, trustFlag] : [];
+
+    let sessionPath: string;
+    let status: string;
     try {
-      started = await herdr(
+      const started = await herdr(
         exec,
-        [
-          "agent", "start", name,
-          "--kind", kind,
-          "--pane", paneId,
-          "--timeout", String(START_TIMEOUT_MS),
-          "--", "--session-id", `lane-${name}-${id}`,
-        ],
+        ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", String(START_TIMEOUT_MS), ...childArgs],
         { signal, timeoutMs: START_TIMEOUT_MS + 15_000 },
       );
-    } catch (error) {
-      // Do not leave an orphan pane behind when the agent never came up.
-      await herdr(exec, ["pane", "close", paneId], { timeoutMs: 10_000 }).catch(() => {});
-      throw error;
-    }
 
-    const sessionPath = started.agent?.agent_session?.value;
-    if (typeof sessionPath !== "string" || !sessionPath.startsWith("/")) {
-      throw new Error(
-        `Herdr started ${kind} in ${paneId} but reported no session file. ` +
-          `Clean reads need one. Close the lane and retry.`,
-      );
+      const reported = started.agent?.agent_session?.value;
+      if (typeof reported !== "string" || !reported.startsWith("/")) {
+        throw new Error(
+          `Herdr started ${kind} in ${paneId} but reported no session file, so a clean read is impossible. ` +
+            `The agent usually waits at a startup dialog. Pane tail:\n${await tailPane(paneId, 20)}`,
+        );
+      }
+      sessionPath = reported;
+      status = String(started.agent?.agent_status ?? "unknown");
+    } catch (error) {
+      // Never leave an orphan pane. It also deadlocks the lane name.
+      if (params.worktree && worktree) {
+        await herdr(exec, ["worktree", "remove", "--workspace", worktree.workspaceId, "--force"], {
+          timeoutMs: 30_000,
+        }).catch(() => {});
+      } else {
+        await herdr(exec, ["pane", "close", paneId], { timeoutMs: 15_000 }).catch(() => {});
+      }
+      throw error;
     }
 
     const lane: Lane = {
@@ -170,7 +279,7 @@ export default function (pi: ExtensionAPI) {
       `Lane ${name} is open.`,
       `  pane    ${paneId}   (workspace ${workspaceId})`,
       `  cwd     ${cwd}`,
-      `  status  ${started.agent?.agent_status ?? "unknown"}`,
+      `  status  ${status}`,
     ];
     if (worktree) lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
     lines.push(`Next: call lane with action "ask".`);
@@ -184,9 +293,25 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
-    const lane = registry.get(params.lane);
+    const lane = await resolveLane(params.lane, signal);
     const task = params.task?.trim();
     if (!task) throw new Error(`Action "ask" needs a task. Pass the full instruction; the lane cannot see this session.`);
+    // An empty session path means the child never reached its prompt. A startup
+    // dialog, above all project trust, is the usual cause. That dialog lives on
+    // screen only, so the pane is the only place to see it.
+    if (!lane.sessionPath) {
+      return ok(
+        [
+          `Lane ${lane.name} reports no session file, so a clean read is impossible.`,
+          `The lane most likely waits at a startup dialog. No task was sent.`,
+          `Answer it with action "keys", or close the lane and open a new one.`,
+          "",
+          "Pane tail:",
+          await tailPane(lane.paneId, 25),
+        ].join("\n"),
+        { blocked: true, lane: lane.name },
+      );
+    }
 
     const baseline = (await readTranscript(lane.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
@@ -200,7 +325,7 @@ export default function (pi: ExtensionAPI) {
       });
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
-        const tail = await tailPane(lane, 30);
+        const tail = await tailPane(lane.paneId, 30);
         return ok(
           [
             `Lane ${lane.name} waits at an approval or question dialog. No input was sent.`,
@@ -257,11 +382,11 @@ export default function (pi: ExtensionAPI) {
    * The only place that reads a terminal. Use it for a blocked dialog, where the
    * dialog exists on screen and never in the JSONL.
    */
-  async function tailPane(lane: Lane, lines: number): Promise<string> {
+  async function tailPane(paneId: string, lines: number): Promise<string> {
     try {
       const text = await herdrText(
         exec,
-        ["pane", "read", lane.paneId, "--source", "recent-unwrapped", "--lines", String(lines)],
+        ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)],
         { timeoutMs: 15_000 },
       );
       const kept = text
@@ -275,6 +400,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function statusLanes(ctx: ExtensionContext, signal?: AbortSignal): Promise<ToolResult> {
+    await adoptLanes(signal);
+
     const open = registry.openLanes();
     if (!open.length) return ok(`No lane is open. Use action "open".`);
 
@@ -284,7 +411,14 @@ export default function (pi: ExtensionAPI) {
     const rows = open.map((lane) => {
       const agent = byPane.get(lane.paneId);
       const state = agent ? String(agent.agent_status) : "gone";
-      const flag = state === "blocked" ? " <- needs input" : state === "gone" ? " <- pane lost" : "";
+      const flag =
+        state === "blocked"
+          ? " <- needs input"
+          : state === "gone"
+            ? " <- pane lost"
+            : lane.adopted
+              ? " <- adopted"
+              : "";
       return `${lane.name.padEnd(16)} ${state.padEnd(8)} ${lane.paneId.padEnd(8)} ${lane.worktree?.branch ?? lane.cwd}${flag}`;
     });
 
@@ -292,8 +426,9 @@ export default function (pi: ExtensionAPI) {
     return ok([`${open.length} lane(s):`, ...rows].join("\n"), { lanes: open.map((l) => l.name) });
   }
 
-  async function traceLane(params: { lane: string; lines?: number }): Promise<ToolResult> {
-    const lane = registry.get(params.lane);
+  async function traceLane(params: { lane: string; lines?: number }, signal?: AbortSignal): Promise<ToolResult> {
+    const lane = await resolveLane(params.lane, signal);
+    if (!lane.sessionPath) return ok(`Lane ${lane.name} has no session file. Pane tail:\n${await tailPane(lane.paneId, 25)}`);
     const transcript = await readTranscript(lane.sessionPath);
     const state = await laneState(lane);
     return ok(
@@ -303,13 +438,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function keysLane(params: { lane: string; keys?: string[] }, signal?: AbortSignal): Promise<ToolResult> {
-    const lane = registry.get(params.lane);
+    const lane = await resolveLane(params.lane, signal);
     const keys = params.keys ?? [];
     if (!keys.length) throw new Error(`Action "keys" needs at least one logical key, for example ["esc"] or ["ctrl+c"].`);
 
     await herdr(exec, ["agent", "send-keys", lane.name, ...keys], { signal, timeoutMs: 15_000 });
     await sleep(400);
-    return ok([`Sent ${keys.join(" ")} to ${lane.name}. State: ${await laneState(lane)}.`, "", await tailPane(lane, 20)].join("\n"));
+    return ok([`Sent ${keys.join(" ")} to ${lane.name}. State: ${await laneState(lane)}.`, "", await tailPane(lane.paneId, 20)].join("\n"));
   }
 
   async function closeLane(
@@ -317,7 +452,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     signal?: AbortSignal,
   ): Promise<ToolResult> {
-    const lane = registry.get(params.lane);
+    const lane = await resolveLane(params.lane, signal);
     const notes: string[] = [];
 
     if (lane.worktree) {
@@ -349,7 +484,7 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry(LANE_ENTRY, { ...lane, closed: true });
     refreshStatus(ctx);
 
-    notes.push(`Transcript stays readable at ${lane.sessionPath}.`);
+    if (lane.sessionPath) notes.push(`Transcript stays readable at ${lane.sessionPath}.`);
     return ok([`Lane ${lane.name} is closed.`, ...notes].join("\n"));
   }
 
@@ -400,6 +535,12 @@ export default function (pi: ExtensionAPI) {
           description: "For open: create an isolated git worktree and workspace. Use this for a lane that writes files.",
         }),
       ),
+      trust: Type.Optional(
+        Type.Boolean({
+          description:
+            "For open: load project-local .pi settings and extensions in the lane. Defaults to false, which ignores them.",
+        }),
+      ),
       branch: Type.Optional(Type.String({ description: "For open with worktree: branch name. Defaults to lane/<name>." })),
       base: Type.Optional(Type.String({ description: "For open with worktree: base ref for the new branch." })),
       keys: Type.Optional(
@@ -429,7 +570,7 @@ export default function (pi: ExtensionAPI) {
         case "status":
           return statusLanes(ctx, signal);
         case "trace":
-          return traceLane({ lane: name, lines: params.lines });
+          return traceLane({ lane: name, lines: params.lines }, signal);
         case "keys":
           return keysLane({ lane: name, keys: params.keys }, signal);
         case "close":

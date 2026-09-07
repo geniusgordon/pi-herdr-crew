@@ -17,6 +17,8 @@ export type Lane = {
   worktree?: { path: string; branch: string; workspaceId: string };
   openedAt: string;
   closed?: boolean;
+  /** True when this session found the lane through `herdr agent list`, not through open. */
+  adopted?: boolean;
 };
 
 export const LANE_ENTRY = "herdr-lane";
