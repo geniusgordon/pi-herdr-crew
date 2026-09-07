@@ -4,12 +4,20 @@
   "description": "Dispatch and manage pi subagents as a Herdr crew. Each member answers through a markdown file, not the terminal.",
   "type": "module",
   "license": "MIT",
+  "author": "Gordon <geniusgordon@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geniusgordon/pi-herdr-crew.git"
+  },
+  "homepage": "https://github.com/geniusgordon/pi-herdr-crew#readme",
+  "bugs": "https://github.com/geniusgordon/pi-herdr-crew/issues",
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
   },
   "files": [
+    "LICENSE",
     "src",
     "README.md"
   ],
