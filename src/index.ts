@@ -33,14 +33,16 @@ import {
   type Exec,
 } from "./herdr.js";
 import {
+  CREW_ROOT,
   findLatestResult,
   inspectResult,
-  taskPaths,
   listTaskFiles,
   readSection,
   renderBrief,
   renderPrompt,
+  taskPaths,
   writeBrief,
+  writeIgnore,
   type ResultInfo,
 } from "./protocol.js";
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
@@ -48,9 +50,7 @@ import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const DEFAULT_ASK_TIMEOUT_MS = 600_000;
 const START_TIMEOUT_MS = 60_000;
-const TRANSCRIPT_SETTLE_MS = 8_000;
 const SHELL_READY_TIMEOUT_MS = 15_000;
-const SETTLED = new Set(["idle", "done", "blocked"]);
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
 
@@ -72,21 +72,6 @@ function slugify(raw: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * The lifecycle state can settle a moment before the child flushes its JSONL.
- * Poll until a new turn lands, then stop.
- */
-async function awaitNewTurn(sessionPath: string, baseline: number): Promise<Transcript> {
-  const deadline = Date.now() + TRANSCRIPT_SETTLE_MS;
-  let last = await readTranscript(sessionPath);
-
-  while (last.turnCount <= baseline && Date.now() < deadline) {
-    await sleep(250);
-    last = await readTranscript(sessionPath);
-  }
-  return last;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -435,21 +420,25 @@ export default function (pi: ExtensionAPI) {
     // task can outlive the member that ran it.
     const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
     const turn = taskId === member.task ? (member.turns ?? 0) + 1 : 1;
-    const paths = taskPaths(member.cwd, taskId, turn);
+    // The orchestrator cwd owns every brief and result. A worktree member runs in
+    // a directory that close removes, so a result stored there dies with it.
+    const paths = taskPaths(ctx.cwd, taskId, turn);
     let prompt = task;
 
     if (useFile) {
+      await writeIgnore(ctx.cwd);
       await writeBrief(
         paths.brief,
         renderBrief({
           member: member.name,
           task,
-          resultRelative: paths.resultRelative,
-          dirRelative: paths.dirRelative,
+          result: paths.result,
+          dir: paths.dir,
+          memberCwd: member.cwd,
           context: params.context,
         }),
       );
-      prompt = renderPrompt(paths.briefRelative);
+      prompt = renderPrompt(paths.brief);
       onUpdate?.(ok(`Wrote ${paths.briefRelative}. ${member.name} is working...`));
     } else {
       onUpdate?.(ok(`${member.name} is working...`));
@@ -515,33 +504,42 @@ export default function (pi: ExtensionAPI) {
 
     const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
     const taskId = pending.taskId;
-    const paths = taskPaths(member.cwd, taskId, pending.turn);
+    const paths = taskPaths(ctx.cwd, taskId, pending.turn);
     const useFile = pending.result !== undefined;
 
     onUpdate?.(ok(`Waiting for ${member.name} on task ${taskId}...`));
 
-    try {
-      await herdr(exec, ["agent", "wait", member.name, "--timeout", String(timeout)], {
-        signal,
-        timeoutMs: timeout + 30_000,
-      });
-    } catch (error) {
-      // A wait that ran out of budget is not a failure of the member. Report the
-      // live state and keep the task in flight so a later collect still works.
-      if (error instanceof HerdrError && error.code === "timeout") {
-        return ok(
-          [
-            `Waiting for ${member.name} exceeded this call's budget. The member keeps working.`,
-            `State: ${await memberState(member)}. Elapsed: ${Math.round((Date.now() - pending.sentAt) / 1000)}s.`,
-            `Call action "collect" again, or action "status" to check on it.`,
-          ].join("\n"),
-          { member: member.name, pending: true },
-        );
-      }
-      throw error;
+    // Wait on the transcript, not on the Herdr lifecycle. `agent prompt` returns
+    // before the child leaves its settled state, so a lifecycle wait can observe
+    // the old state and return at once. A completed turn appends a turn summary
+    // to the child session file, which is an unambiguous signal.
+    const outcome = await waitForTurn(member, pending.baseline, timeout, signal, onUpdate);
+
+    if (outcome.kind === "timeout") {
+      return ok(
+        [
+          `Waiting for ${member.name} exceeded this call's budget. The member keeps working.`,
+          `State: ${outcome.state}. Elapsed: ${Math.round((Date.now() - pending.sentAt) / 1000)}s.`,
+          `Call action "collect" again, or action "status" to check on it.`,
+        ].join("\n"),
+        { member: member.name, pending: true },
+      );
     }
 
-    const transcript = await awaitNewTurn(member.sessionPath, pending.baseline);
+    if (outcome.kind === "blocked") {
+      return ok(
+        [
+          `Member ${member.name} waits at an approval or question dialog.`,
+          `Ask the user how to answer it, then use action "keys", then action "collect" again.`,
+          "",
+          "Pane tail:",
+          await tailPane(member.paneId, 30),
+        ].join("\n"),
+        { blocked: true, member: member.name, pending: true },
+      );
+    }
+
+    const transcript = outcome.transcript;
     const state = await memberState(member);
     const meta = [
       `member=${member.name}`,
@@ -559,7 +557,7 @@ export default function (pi: ExtensionAPI) {
     refreshStatus(ctx);
 
     if (useFile) {
-      const info = await inspectResult(paths.result, member.cwd);
+      const info = await inspectResult(paths.result, ctx.cwd);
 
       // A member that ignored the brief still answered. Fall back to its reply
       // instead of losing the work.
@@ -575,7 +573,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const files = await listTaskFiles(member.cwd, taskId);
+      const files = await listTaskFiles(ctx.cwd, taskId);
       const extras = files.filter((file) => !/^(brief|result)(-\d+)?\.md$/.test(file.name));
 
       return ok(
@@ -616,27 +614,36 @@ export default function (pi: ExtensionAPI) {
    * the point: the parent decides what to pull in.
    */
   async function readResult(
-    params: { member: string; section?: string; max_bytes?: number; task_id?: string },
+    params: { member?: string; section?: string; max_bytes?: number; task_id?: string },
+    ctx: ExtensionContext,
     signal?: AbortSignal,
   ): Promise<ToolResult> {
-    const member = await resolveMember(params.member, signal);
+    // A task lives in the orchestrator cwd, so it outlives its member. Read a
+    // result by task id alone when the member is already closed.
+    let taskId = params.task_id ? slugify(params.task_id) : undefined;
+    let member: Member | undefined;
 
-    // An adopted member carries no memory of its last result. Disk holds it.
-    const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
-    const path = member.lastResult ?? (await findLatestResult(member.cwd, taskId));
+    if (params.member) {
+      member = await resolveMember(params.member, signal);
+      taskId ??= member.task ?? member.name;
+    }
+    if (!taskId) {
+      throw new Error(`Action "result" needs a member name or a task_id.`);
+    }
+
+    const path = member?.lastResult ?? (await findLatestResult(ctx.cwd, taskId));
     if (!path) {
       throw new Error(
-        `Member ${member.name} has no result file in ${member.cwd}/.pi/crew/${taskId}. ` +
-          `Run action "ask" without inline true first.`,
+        `No result file in ${CREW_ROOT}/${taskId}. Run action "ask" without inline true first.`,
       );
     }
-    if (path !== member.lastResult) persist({ ...member, lastResult: path });
+    if (member && path !== member.lastResult) persist({ ...member, lastResult: path });
 
-    const info: ResultInfo = await inspectResult(path, member.cwd);
+    const info: ResultInfo = await inspectResult(path, ctx.cwd);
     if (!info.exists) throw new Error(`Result file ${info.relative} does not exist.`);
 
     if (!params.section) {
-      const files = await listTaskFiles(member.cwd, taskId);
+      const files = await listTaskFiles(ctx.cwd, taskId);
       return ok(
         [
           `${info.relative} · ${info.bytes} bytes · ${info.lines} lines`,
@@ -646,12 +653,12 @@ export default function (pi: ExtensionAPI) {
         ]
           .filter((line) => line !== "")
           .join("\n"),
-        { member: member.name, task: taskId, result: info },
+        { member: member?.name, task: taskId, result: info },
       );
     }
 
     const body = await readSection(path, { section: params.section, maxBytes: params.max_bytes });
-    return ok(body, { member: member.name, section: params.section });
+    return ok(body, { member: member?.name, task: taskId, section: params.section });
   }
 
   /**
@@ -688,6 +695,51 @@ export default function (pi: ExtensionAPI) {
         await sleep(Math.min(250 * attempt, 1_000));
       }
     }
+  }
+
+  type Outcome =
+    | { kind: "done"; transcript: Transcript }
+    | { kind: "blocked" }
+    | { kind: "timeout"; state: string };
+
+  /**
+   * Wait for the member to finish one turn.
+   *
+   * The child session file is the settle signal, because a completed turn
+   * appends a turn summary to it. Reading that file is a local read, so poll it
+   * often. Ask Herdr for the lifecycle state rarely, only to catch a dialog.
+   */
+  async function waitForTurn(
+    member: Member,
+    baseline: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    onUpdate?: (result: ToolResult) => void,
+  ): Promise<Outcome> {
+    const empty: Transcript = { turns: [], toolNames: [], turnCount: 0 };
+    const deadline = Date.now() + timeoutMs;
+    let lastState = "unknown";
+
+    for (let tick = 0; Date.now() < deadline; tick += 1) {
+      if (signal?.aborted) return { kind: "timeout", state: lastState };
+
+      const transcript = await readTranscript(member.sessionPath).catch(() => empty);
+      if (transcript.turnCount > baseline) return { kind: "done", transcript };
+
+      // Check Herdr every fifth tick. A dialog stops the turn forever otherwise.
+      if (tick % 5 === 0) {
+        lastState = await memberState(member);
+        if (lastState === "blocked") return { kind: "blocked" };
+        if (lastState === "gone") return { kind: "timeout", state: lastState };
+        if (tick > 0 && tick % 30 === 0) {
+          onUpdate?.(ok(`${member.name} still working, ${Math.round((timeoutMs - (deadline - Date.now())) / 1000)}s elapsed...`));
+        }
+      }
+
+      await sleep(1_000);
+    }
+
+    return { kind: "timeout", state: lastState };
   }
 
   /** True when the member pane is the only pane in its tab, so closing the tab is right. */
@@ -759,9 +811,17 @@ export default function (pi: ExtensionAPI) {
 
   async function traceMember(params: { member: string; lines?: number }, signal?: AbortSignal): Promise<ToolResult> {
     const member = await resolveMember(params.member, signal);
-    if (!member.sessionPath) return ok(`Member ${member.name} has no session file. Pane tail:\n${await tailPane(member.paneId, 25)}`);
-    const transcript = await readTranscript(member.sessionPath);
+    const transcript = member.sessionPath ? await readTranscript(member.sessionPath).catch(() => undefined) : undefined;
     const state = await memberState(member);
+
+    // No session file means the member never took a turn. The pane is then the
+    // only evidence, usually a startup dialog.
+    if (!transcript) {
+      return ok(
+        [`Member ${member.name} has taken no turn (state: ${state}). Pane tail:`, await tailPane(member.paneId, 25)].join("\n"),
+        { member: member.name, state },
+      );
+    }
     return ok(
       [`Member ${member.name} (state: ${state}, ${transcript.turnCount} turn(s)):`, formatTrace(transcript, params.lines ?? 40)].join("\n"),
       { member: member.name, state },
@@ -899,7 +959,8 @@ export default function (pi: ExtensionAPI) {
       task_id: Type.Optional(
         Type.String({
           description:
-            "For ask and result: task name, which becomes the directory .pi/crew/<task_id>/. Defaults to the member name.",
+            "For ask and result: task name, which becomes the directory .pi/crew/<task_id>/ in this session's cwd. " +
+            "Defaults to the member name. Action result accepts it without a member, because a task outlives its member.",
         }),
       ),
       kind: Type.Optional(
@@ -941,8 +1002,10 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const needsMember = params.action !== "status";
-      if (needsMember && !params.member) throw new Error(`Action "${params.action}" needs a member name.`);
+      // status needs no member. result accepts a task_id alone, because a task
+      // lives in the orchestrator cwd and outlives the member that ran it.
+      const optional = params.action === "status" || (params.action === "result" && !!params.task_id);
+      if (!optional && !params.member) throw new Error(`Action "${params.action}" needs a member name.`);
       const name = params.member as string;
 
       switch (params.action) {
@@ -954,7 +1017,8 @@ export default function (pi: ExtensionAPI) {
           return collectMember({ member: name, timeout_ms: params.timeout_ms }, ctx, signal, onUpdate);
         case "result":
           return readResult(
-            { member: name, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
+            { member: params.member, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
+            ctx,
             signal,
           );
         case "status":

@@ -17,46 +17,51 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
-/** Root that holds one directory per task, relative to the member cwd. */
+/** Root that holds one directory per task, relative to the orchestrator cwd. */
 export const CREW_ROOT = ".pi/crew";
 
 export type Paths = {
-  /** Absolute task directory. One directory per task holds every turn. */
+  /** Absolute task directory in the orchestrator cwd. One directory per task. */
   dir: string;
-  /** Absolute brief path, for the parent to write. */
+  /** Absolute brief path, written by the orchestrator, read by the member. */
   brief: string;
-  /** Absolute result path, for the member to write. */
+  /** Absolute result path, written by the member, read by the orchestrator. */
   result: string;
-  /** Task directory as the member sees it, relative to its own cwd. */
+  /** Task directory relative to the orchestrator cwd, for display. */
   dirRelative: string;
-  /** Brief path as the member sees it, relative to its own cwd. */
+  /** Brief path relative to the orchestrator cwd, for display. */
   briefRelative: string;
-  /** Result path as the member sees it, relative to its own cwd. */
+  /** Result path relative to the orchestrator cwd, for display. */
   resultRelative: string;
 };
 
 /**
- * Lay out one task as a directory, not as flat files.
+ * Lay out one task as a directory in the orchestrator cwd.
  *
- *   .pi/crew/<task>/brief.md      turn 1
- *   .pi/crew/<task>/result.md     turn 1
- *   .pi/crew/<task>/brief-2.md    turn 2
- *   .pi/crew/<task>/result-2.md   turn 2
+ *   <orchestrator cwd>/.pi/crew/<task>/brief.md      turn 1
+ *   <orchestrator cwd>/.pi/crew/<task>/result.md     turn 1
+ *   <orchestrator cwd>/.pi/crew/<task>/brief-2.md    turn 2
+ *   <orchestrator cwd>/.pi/crew/<task>/result-2.md   turn 2
  *
- * The member can also write extra files beside them, such as a patch or a table,
- * and everything for that task stays in one place.
+ * The orchestrator cwd owns these files, not the member cwd. A worktree member
+ * runs in a directory that `close` removes, and a result stored there dies with
+ * it. Verified: every worktree result written during development was lost this
+ * way.
+ *
+ * The member therefore receives absolute paths. A work product such as a patch
+ * still belongs in the member's own directory, because it must be committed
+ * with the code.
  */
-export function taskPaths(memberCwd: string, task: string, turn: number): Paths {
-  const dir = join(memberCwd, CREW_ROOT, task);
-  const dirRelative = `${CREW_ROOT}/${task}`;
+export function taskPaths(orchestratorCwd: string, task: string, turn: number): Paths {
+  const dir = join(orchestratorCwd, CREW_ROOT, task);
   const suffix = turn > 1 ? `-${turn}` : "";
   return {
     dir,
-    dirRelative,
+    dirRelative: `${CREW_ROOT}/${task}`,
     brief: join(dir, `brief${suffix}.md`),
     result: join(dir, `result${suffix}.md`),
-    briefRelative: `${dirRelative}/brief${suffix}.md`,
-    resultRelative: `${dirRelative}/result${suffix}.md`,
+    briefRelative: `${CREW_ROOT}/${task}/brief${suffix}.md`,
+    resultRelative: `${CREW_ROOT}/${task}/result${suffix}.md`,
   };
 }
 
@@ -69,8 +74,12 @@ export function taskPaths(memberCwd: string, task: string, turn: number): Paths 
 export function renderBrief(options: {
   member: string;
   task: string;
-  resultRelative: string;
-  dirRelative: string;
+  /** Absolute result path. The member cwd may differ from the orchestrator cwd. */
+  result: string;
+  /** Absolute task directory, for an extra orchestration artifact. */
+  dir: string;
+  /** The member's own working directory, for a work product such as a patch. */
+  memberCwd: string;
   context?: string;
 }): string {
   const lines = [
@@ -89,11 +98,14 @@ export function renderBrief(options: {
   lines.push(
     "## Deliverable",
     "",
-    `Write your complete answer to \`${options.resultRelative}\`.`,
+    `Write your complete answer to this exact absolute path:`,
+    "",
+    `    ${options.result}`,
+    "",
     "Create the parent directory first if it does not exist.",
+    "That path is outside your working directory. Use it exactly as written.",
     "Use markdown headings, one section per topic.",
     "Put every detail in that file, because it is the only durable output.",
-    `Write any extra artifact, such as a patch or a table, into \`${options.dirRelative}/\` beside it.`,
     "",
     "## Reply",
     "",
@@ -103,8 +115,9 @@ export function renderBrief(options: {
     "## Rules",
     "",
     "1. You cannot see the orchestrator conversation. This brief holds every needed fact.",
-    "2. Write files inside your own working directory only.",
-    "3. Report a blocker in the result file, then reply with BLOCKED and the reason.",
+    `2. Write a work product, such as a patch or a source file, into \`${options.memberCwd}\`.`,
+    `3. Write an extra orchestration artifact, such as a table, into \`${options.dir}\`.`,
+    "4. Report a blocker in the result file, then reply with BLOCKED and the reason.",
     "",
   );
 
@@ -112,13 +125,33 @@ export function renderBrief(options: {
 }
 
 /** The task text sent through `herdr agent prompt`. It stays one line and short. */
-export function renderPrompt(briefRelative: string): string {
-  return `Read ${briefRelative} in your current directory and follow it exactly.`;
+export function renderPrompt(brief: string): string {
+  return `Read ${brief} and follow it exactly.`;
 }
 
 export async function writeBrief(path: string, body: string): Promise<void> {
   await mkdir(resolve(path, ".."), { recursive: true });
   await writeFile(path, body, "utf8");
+}
+
+/**
+ * Keep crew files out of Git.
+ *
+ * These files are orchestration scratch data, never shared work. A user with
+ * `.pi/` in a global ignore file never sees them, but a teammate without that
+ * line does. Write the rule into the repository instead of relying on a machine
+ * setting.
+ */
+export async function writeIgnore(orchestratorCwd: string): Promise<void> {
+  const path = join(orchestratorCwd, CREW_ROOT, ".gitignore");
+  try {
+    await stat(path);
+    return;
+  } catch {
+    // Absent, so write it once.
+  }
+  await mkdir(join(orchestratorCwd, CREW_ROOT), { recursive: true });
+  await writeFile(path, "# Crew orchestration scratch data. Never shared work.\n*\n", "utf8");
 }
 
 export type ResultInfo = {
@@ -137,8 +170,8 @@ export type ResultInfo = {
  * This is the whole saving. The parent learns the shape and reads a section
  * only when it needs one.
  */
-export async function inspectResult(path: string, memberCwd: string): Promise<ResultInfo> {
-  const rel = isAbsolute(path) ? relative(memberCwd, path) : path;
+export async function inspectResult(path: string, orchestratorCwd: string): Promise<ResultInfo> {
+  const rel = isAbsolute(path) ? relative(orchestratorCwd, path) : path;
   const info: ResultInfo = { path, relative: rel, exists: false, bytes: 0, lines: 0, headings: [] };
 
   try {
@@ -166,8 +199,8 @@ export async function inspectResult(path: string, memberCwd: string): Promise<Re
  * A member outlives its parent, so a new parent adopts it with no memory of the
  * last result path. Disk holds that fact, so read it from there.
  */
-export async function findLatestResult(memberCwd: string, task: string): Promise<string | undefined> {
-  const dir = join(memberCwd, CREW_ROOT, task);
+export async function findLatestResult(orchestratorCwd: string, task: string): Promise<string | undefined> {
+  const dir = join(orchestratorCwd, CREW_ROOT, task);
   const names = await readdir(dir).catch(() => [] as string[]);
 
   const candidates = names.filter((name) => /^result(-\d+)?\.md$/.test(name));
@@ -186,8 +219,8 @@ export async function findLatestResult(memberCwd: string, task: string): Promise
 }
 
 /** Every file in the task directory, so the parent can see extra artifacts. */
-export async function listTaskFiles(memberCwd: string, task: string): Promise<Array<{ name: string; bytes: number }>> {
-  const dir = join(memberCwd, CREW_ROOT, task);
+export async function listTaskFiles(orchestratorCwd: string, task: string): Promise<Array<{ name: string; bytes: number }>> {
+  const dir = join(orchestratorCwd, CREW_ROOT, task);
   const names = await readdir(dir).catch(() => [] as string[]);
 
   const files = await Promise.all(

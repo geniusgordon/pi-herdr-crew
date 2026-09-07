@@ -50,12 +50,13 @@ ln -s /path/to/pi-herdr/src ~/.pi/agent/extensions/herdr-crew
 
 ## The `crew` tool
 
-One tool, seven actions.
+One tool, eight actions.
 
 | Action | What it does |
 |---|---|
 | `open` | Create a tab, or a git worktree, then start an agent under a member name |
 | `ask` | Write a brief, send the task, wait, return the summary line and the result shape |
+| `collect` | Wait for a task sent with `wait=false`, or resume a wait that ran out of budget |
 | `result` | List the result sections, or return one named section |
 | `status` | One line per member with live Herdr state |
 | `trace` | The member's tool calls and messages in order |
@@ -81,19 +82,36 @@ workspace instead.
 
 ## The file protocol
 
-One directory per task:
+One directory per task, in the orchestrator's working directory:
 
 ```
-.pi/crew/<task_id>/brief.md       turn 1, written by the parent
-.pi/crew/<task_id>/result.md      turn 1, written by the member
-.pi/crew/<task_id>/brief-2.md     turn 2
-.pi/crew/<task_id>/result-2.md    turn 2
-.pi/crew/<task_id>/app.ts.patch   any extra artifact the member writes
+<your cwd>/.pi/crew/<task_id>/brief.md      turn 1, written by the orchestrator
+<your cwd>/.pi/crew/<task_id>/result.md     turn 1, written by the member
+<your cwd>/.pi/crew/<task_id>/brief-2.md    turn 2
+<your cwd>/.pi/crew/<task_id>/result-2.md   turn 2
 ```
 
-`task_id` defaults to the member name. Pass it when one member runs several tasks.
-The extension reports every extra file in that directory, so an artifact never
-goes unnoticed.
+The orchestrator's directory owns these files, not the member's. A worktree
+member runs in a directory that `close` removes, so a result stored there dies
+with it. The member therefore receives absolute paths.
+
+Two kinds of file, two places:
+
+| Kind | Example | Location |
+|---|---|---|
+| Result | `result.md` | orchestrator cwd, survives close |
+| Work product | `FIX.ts`, a patch | member cwd, committed with the code |
+
+`task_id` defaults to the member name. Pass it when one member runs several
+tasks. A task outlives its member, so `result` accepts a `task_id` with no
+member name:
+
+```
+crew action=result task_id="error-audit"
+```
+
+The extension writes `.pi/crew/.gitignore` containing `*` on first use, so these
+files never reach Git.
 
 The brief fixes the contract: write the answer to the result file, reply with one
 line starting DONE or BLOCKED, and never paste the answer into the reply.
@@ -149,6 +167,27 @@ that a member finished.
 trust dialog, and a worktree path is always new. The extension passes
 `--no-approve`, which ignores project-local `.pi` resources. Pass `trust=true`
 to load them with `--approve`.
+
+**`ask` does not hold one long call.** A single blocking call can exceed the
+parent tool-call budget. The call is then killed, the answer is lost, and the
+member keeps working. So `ask` sends the prompt, then waits separately. Pass
+`wait=false` to return at once, then `collect` each member:
+
+```
+crew action=ask member=a task="..." wait=false
+crew action=ask member=b task="..." wait=false
+crew action=status
+crew action=collect member=a
+crew action=collect member=b
+```
+
+A wait that runs out of budget reports the live state and keeps the task in
+flight, so a later `collect` still returns the answer.
+
+**The settle signal is the child session file, not the Herdr lifecycle.**
+`agent prompt` returns before the child leaves its settled state, so a lifecycle
+wait can observe the old state and return at once. A completed turn appends a
+turn summary to the child session file, which is unambiguous.
 
 **A fresh tab pane is not ready at once.** `agent start` then fails with
 `agent_pane_busy`. Measured on one machine, the shell needs about one second, so
