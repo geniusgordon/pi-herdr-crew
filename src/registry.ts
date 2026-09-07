@@ -1,35 +1,35 @@
 /**
- * Lane bookkeeping.
+ * Member bookkeeping.
  *
  * Herdr owns liveness: `herdr agent list` is the truth for pane and status.
  * This registry stores only what Herdr does not give back later, above all the
  * child session JSONL path used for clean reads.
  */
 
-export type Lane = {
+export type Member = {
   name: string;
   paneId: string;
   workspaceId: string;
-  /** Set for a tab lane and a worktree lane. Closing a tab lane closes this tab. */
+  /** Set for a tab member and a worktree member. Closing a tab member closes this tab. */
   tabId?: string;
   sessionPath: string;
   cwd: string;
   kind: string;
-  /** How the lane got its terminal. It decides what close must remove. */
+  /** How the member got its terminal. It decides what close must remove. */
   layout?: "tab" | "split" | "worktree";
-  /** Set when the lane owns a Herdr git worktree. */
+  /** Set when the member owns a Herdr git worktree. */
   worktree?: {
     path: string;
     branch: string;
     workspaceId: string;
-    /** Workspace holding the main checkout, so the lane groups under its repository. */
+    /** Workspace holding the main checkout, so the member groups under its repository. */
     sourceWorkspaceId?: string;
   };
   openedAt: string;
   closed?: boolean;
-  /** True when this session found the lane through `herdr agent list`, not through open. */
+  /** True when this session found the member through `herdr agent list`, not through open. */
   adopted?: boolean;
-  /** Current task id. It names the directory under .pi/lanes. */
+  /** Current task id. It names the directory under .pi/members. */
   task?: string;
   /** Completed ask calls for the current task. It numbers the brief and result files. */
   turns?: number;
@@ -37,54 +37,54 @@ export type Lane = {
   lastResult?: string;
 };
 
-export const LANE_ENTRY = "herdr-lane";
+export const CREW_ENTRY = "herdr-member";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
-export function assertLaneName(name: string): void {
+export function assertMemberName(name: string): void {
   if (!NAME_RE.test(name)) {
-    throw new Error(`Lane name "${name}" is invalid. Use [a-z][a-z0-9_-]{0,31}, for example "review-api".`);
+    throw new Error(`Member name "${name}" is invalid. Use [a-z][a-z0-9_-]{0,31}, for example "review-api".`);
   }
 }
 
-export class LaneRegistry {
-  private lanes = new Map<string, Lane>();
+export class MemberRegistry {
+  private members = new Map<string, Member>();
 
-  put(lane: Lane): void {
-    this.lanes.set(lane.name, lane);
+  put(member: Member): void {
+    this.members.set(member.name, member);
   }
 
-  get(name: string): Lane {
-    const lane = this.lanes.get(name);
-    if (!lane) {
+  get(name: string): Member {
+    const member = this.members.get(name);
+    if (!member) {
       const open = this.openNames();
-      const hint = open.length ? ` Open lanes: ${open.join(", ")}.` : " No lane is open.";
-      throw new Error(`Unknown lane "${name}".${hint}`);
+      const hint = open.length ? ` Open members: ${open.join(", ")}.` : " No member is open.";
+      throw new Error(`Unknown member "${name}".${hint}`);
     }
-    if (lane.closed) throw new Error(`Lane "${name}" is closed. Open a new lane instead.`);
-    return lane;
+    if (member.closed) throw new Error(`Member "${name}" is closed. Open a new member instead.`);
+    return member;
   }
 
   markClosed(name: string): void {
-    const lane = this.lanes.get(name);
-    if (lane) lane.closed = true;
+    const member = this.members.get(name);
+    if (member) member.closed = true;
   }
 
-  openLanes(): Lane[] {
-    return [...this.lanes.values()].filter((lane) => !lane.closed);
+  openMembers(): Member[] {
+    return [...this.members.values()].filter((member) => !member.closed);
   }
 
   openNames(): string[] {
-    return this.openLanes().map((lane) => lane.name);
+    return this.openMembers().map((member) => member.name);
   }
 
   /** Rebuild from persisted session entries after a reload or a resume. */
   restore(entries: Iterable<any>): void {
-    this.lanes.clear();
+    this.members.clear();
     for (const entry of entries) {
-      if (entry?.type !== "custom" || entry.customType !== LANE_ENTRY) continue;
-      const lane = entry.data as Lane | undefined;
-      if (lane?.name) this.lanes.set(lane.name, lane);
+      if (entry?.type !== "custom" || entry.customType !== CREW_ENTRY) continue;
+      const member = entry.data as Member | undefined;
+      if (member?.name) this.members.set(member.name, member);
     }
   }
 }

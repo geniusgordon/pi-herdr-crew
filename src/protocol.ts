@@ -1,15 +1,15 @@
 /**
  * The file protocol.
  *
- * A lane answer must not enter the parent context whole. Measured on one audit
+ * A member answer must not enter the parent context whole. Measured on one audit
  * of a 6-line file, the child produced 8256 bytes of markdown. Reading that
  * from the child session file is clean next to the terminal, but it is not
  * small.
  *
  * The protocol moves the payload to disk:
  *   1. The parent writes a brief file.
- *   2. The lane reads that brief and writes a result file.
- *   3. The lane replies with one summary line.
+ *   2. The member reads that brief and writes a result file.
+ *   3. The member replies with one summary line.
  *
  * The same audit then cost the parent 26 bytes, a 317x reduction.
  */
@@ -17,38 +17,38 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
-/** Root that holds one directory per task, relative to the lane cwd. */
-export const LANE_ROOT = ".pi/lanes";
+/** Root that holds one directory per task, relative to the member cwd. */
+export const CREW_ROOT = ".pi/crew";
 
 export type Paths = {
   /** Absolute task directory. One directory per task holds every turn. */
   dir: string;
   /** Absolute brief path, for the parent to write. */
   brief: string;
-  /** Absolute result path, for the lane to write. */
+  /** Absolute result path, for the member to write. */
   result: string;
-  /** Task directory as the lane sees it, relative to its own cwd. */
+  /** Task directory as the member sees it, relative to its own cwd. */
   dirRelative: string;
-  /** Brief path as the lane sees it, relative to its own cwd. */
+  /** Brief path as the member sees it, relative to its own cwd. */
   briefRelative: string;
-  /** Result path as the lane sees it, relative to its own cwd. */
+  /** Result path as the member sees it, relative to its own cwd. */
   resultRelative: string;
 };
 
 /**
  * Lay out one task as a directory, not as flat files.
  *
- *   .pi/lanes/<task>/brief.md      turn 1
- *   .pi/lanes/<task>/result.md     turn 1
- *   .pi/lanes/<task>/brief-2.md    turn 2
- *   .pi/lanes/<task>/result-2.md   turn 2
+ *   .pi/crew/<task>/brief.md      turn 1
+ *   .pi/crew/<task>/result.md     turn 1
+ *   .pi/crew/<task>/brief-2.md    turn 2
+ *   .pi/crew/<task>/result-2.md   turn 2
  *
- * The lane can also write extra files beside them, such as a patch or a table,
+ * The member can also write extra files beside them, such as a patch or a table,
  * and everything for that task stays in one place.
  */
-export function lanePaths(laneCwd: string, task: string, turn: number): Paths {
-  const dir = join(laneCwd, LANE_ROOT, task);
-  const dirRelative = `${LANE_ROOT}/${task}`;
+export function taskPaths(memberCwd: string, task: string, turn: number): Paths {
+  const dir = join(memberCwd, CREW_ROOT, task);
+  const dirRelative = `${CREW_ROOT}/${task}`;
   const suffix = turn > 1 ? `-${turn}` : "";
   return {
     dir,
@@ -63,18 +63,18 @@ export function lanePaths(laneCwd: string, task: string, turn: number): Paths {
 /**
  * Build the brief file body.
  *
- * The Deliverable and Reply sections are fixed, not advisory. A lane that
+ * The Deliverable and Reply sections are fixed, not advisory. A member that
  * pastes its answer into the reply defeats the whole protocol.
  */
 export function renderBrief(options: {
-  lane: string;
+  member: string;
   task: string;
   resultRelative: string;
   dirRelative: string;
   context?: string;
 }): string {
   const lines = [
-    `# Brief: ${options.lane}`,
+    `# Brief: ${options.member}`,
     "",
     "## Task",
     "",
@@ -137,8 +137,8 @@ export type ResultInfo = {
  * This is the whole saving. The parent learns the shape and reads a section
  * only when it needs one.
  */
-export async function inspectResult(path: string, laneCwd: string): Promise<ResultInfo> {
-  const rel = isAbsolute(path) ? relative(laneCwd, path) : path;
+export async function inspectResult(path: string, memberCwd: string): Promise<ResultInfo> {
+  const rel = isAbsolute(path) ? relative(memberCwd, path) : path;
   const info: ResultInfo = { path, relative: rel, exists: false, bytes: 0, lines: 0, headings: [] };
 
   try {
@@ -161,13 +161,13 @@ export async function inspectResult(path: string, laneCwd: string): Promise<Resu
 }
 
 /**
- * Find the newest result file for a lane by scanning its directory.
+ * Find the newest result file for a member by scanning its directory.
  *
- * A lane outlives its parent, so a new parent adopts it with no memory of the
+ * A member outlives its parent, so a new parent adopts it with no memory of the
  * last result path. Disk holds that fact, so read it from there.
  */
-export async function findLatestResult(laneCwd: string, task: string): Promise<string | undefined> {
-  const dir = join(laneCwd, LANE_ROOT, task);
+export async function findLatestResult(memberCwd: string, task: string): Promise<string | undefined> {
+  const dir = join(memberCwd, CREW_ROOT, task);
   const names = await readdir(dir).catch(() => [] as string[]);
 
   const candidates = names.filter((name) => /^result(-\d+)?\.md$/.test(name));
@@ -186,8 +186,8 @@ export async function findLatestResult(laneCwd: string, task: string): Promise<s
 }
 
 /** Every file in the task directory, so the parent can see extra artifacts. */
-export async function listTaskFiles(laneCwd: string, task: string): Promise<Array<{ name: string; bytes: number }>> {
-  const dir = join(laneCwd, LANE_ROOT, task);
+export async function listTaskFiles(memberCwd: string, task: string): Promise<Array<{ name: string; bytes: number }>> {
+  const dir = join(memberCwd, CREW_ROOT, task);
   const names = await readdir(dir).catch(() => [] as string[]);
 
   const files = await Promise.all(

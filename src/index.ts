@@ -1,17 +1,20 @@
 /**
- * pi-herdr-lane
+ * pi-herdr-crew
  *
- * Turn this pi session into an orchestrator over Herdr panes.
+ * Turn this pi session into an orchestrator over Herdr panes. Each crew member
+ * is a pi agent in its own visible tab, and the user can take one over by
+ * typing in it.
  *
  * Split of duty:
  *   Herdr owns the process, the pane, and the lifecycle state.
- *   The child session JSONL owns the data.
+ *   A markdown file owns the payload.
+ *   The child session JSONL owns the trace and the fallback reply.
  *
- * `herdr agent read` returns the raw terminal, which carries the startup
- * banner, the skill list, the extension list, and the token bar. That is about
- * 2.5 KB of noise for a 0.15 KB answer. This extension never reads the
- * terminal for results. It reads the child session file that
- * `herdr agent start` reports back.
+ * A member answer must not enter this context whole. `herdr agent read` returns
+ * the raw terminal, which carries the startup banner, the skill list, and the
+ * token bar. Reading the child session file removes that noise but does not
+ * bound the size. So a member writes markdown to disk and replies with one
+ * summary line. Measured on a 15942 byte audit, this context took 167 bytes.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -32,7 +35,7 @@ import {
 import {
   findLatestResult,
   inspectResult,
-  lanePaths,
+  taskPaths,
   listTaskFiles,
   readSection,
   renderBrief,
@@ -40,7 +43,7 @@ import {
   writeBrief,
   type ResultInfo,
 } from "./protocol.js";
-import { LANE_ENTRY, LaneRegistry, assertLaneName, type Lane } from "./registry.js";
+import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member } from "./registry.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const DEFAULT_ASK_TIMEOUT_MS = 600_000;
@@ -87,14 +90,14 @@ async function awaitNewTurn(sessionPath: string, baseline: number): Promise<Tran
 }
 
 export default function (pi: ExtensionAPI) {
-  const registry = new LaneRegistry();
+  const registry = new MemberRegistry();
   const exec: Exec = (command, args, options) => pi.exec(command, args, options);
 
   // ---------------------------------------------------------------- lifecycle
 
   pi.on("session_start", async (_event, ctx) => {
     if (!inHerdr()) {
-      ctx.ui.setStatus("herdr-lane", undefined);
+      ctx.ui.setStatus("herdr-crew", undefined);
       return;
     }
     registry.restore(ctx.sessionManager.getEntries());
@@ -102,13 +105,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   function refreshStatus(ctx: ExtensionContext): void {
-    const open = registry.openLanes();
-    ctx.ui.setStatus("herdr-lane", open.length ? `lanes: ${open.map((l) => l.name).join(" ")}` : undefined);
+    const open = registry.openMembers();
+    ctx.ui.setStatus("herdr-crew", open.length ? `members: ${open.map((m) => m.name).join(" ")}` : undefined);
   }
 
-  function persist(lane: Lane): void {
-    registry.put(lane);
-    pi.appendEntry(LANE_ENTRY, lane);
+  function persist(member: Member): void {
+    registry.put(member);
+    pi.appendEntry(CREW_ENTRY, member);
   }
 
   // ------------------------------------------------------------------ actions
@@ -116,22 +119,22 @@ export default function (pi: ExtensionAPI) {
   /**
    * Adopt every named Herdr agent that this registry does not know yet.
    *
-   * Herdr, not this session, owns lane liveness. A lane outlives its parent, so
+   * Herdr, not this session, owns member liveness. A member outlives its parent, so
    * a new or reloaded parent must find it again. `agent list` already reports
    * the name, the pane, the cwd, and the session file, which is everything a
    * clean read needs. A half-finished open leaves the same state behind.
    */
-  async function adoptLanes(signal?: AbortSignal): Promise<Lane[]> {
+  async function adoptMembers(signal?: AbortSignal): Promise<Member[]> {
     const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
     const known = new Set(registry.openNames());
-    const adopted: Lane[] = [];
+    const adopted: Member[] = [];
 
     for (const agent of live.agents ?? []) {
       const name = agent?.name;
       const sessionPath = agent?.agent_session?.value;
       if (typeof name !== "string" || known.has(name)) continue;
 
-      const lane: Lane = {
+      const member: Member = {
         name,
         paneId: String(agent.pane_id),
         workspaceId: String(agent.workspace_id),
@@ -143,49 +146,49 @@ export default function (pi: ExtensionAPI) {
         adopted: true,
       };
 
-      // A worktree lane sits in its own workspace. Match on that workspace id.
-      if (lane.cwd) {
-        const list = await herdr(exec, ["worktree", "list", "--cwd", lane.cwd], { signal, timeoutMs: 15_000 }).catch(
+      // A worktree member sits in its own workspace. Match on that workspace id.
+      if (member.cwd) {
+        const list = await herdr(exec, ["worktree", "list", "--cwd", member.cwd], { signal, timeoutMs: 15_000 }).catch(
           () => undefined,
         );
         const match = (list?.worktrees ?? []).find(
-          (wt: any) => wt?.is_linked_worktree && wt?.open_workspace_id === lane.workspaceId,
+          (wt: any) => wt?.is_linked_worktree && wt?.open_workspace_id === member.workspaceId,
         );
         if (match) {
-          lane.worktree = { path: String(match.path), branch: String(match.branch), workspaceId: lane.workspaceId };
+          member.worktree = { path: String(match.path), branch: String(match.branch), workspaceId: member.workspaceId };
         }
       }
 
-      persist(lane);
-      adopted.push(lane);
+      persist(member);
+      adopted.push(member);
     }
 
     return adopted;
   }
 
   /**
-   * Resolve a lane against live Herdr state.
+   * Resolve a member against live Herdr state.
    *
    * Never trust the cached pane id or session path. A pane move changes the pane
-   * id, and a lane that started at a dialog reports its session file only after
+   * id, and a member that started at a dialog reports its session file only after
    * it reaches its prompt. One `agent get` call keeps both fields current.
    */
-  async function resolveLane(name: string, signal?: AbortSignal): Promise<Lane> {
-    if (!registry.openNames().includes(name)) await adoptLanes(signal);
-    const lane = registry.get(name);
+  async function resolveMember(name: string, signal?: AbortSignal): Promise<Member> {
+    if (!registry.openNames().includes(name)) await adoptMembers(signal);
+    const member = registry.get(name);
 
     const live = await herdr(exec, ["agent", "get", name], { signal, timeoutMs: 10_000 }).catch(() => undefined);
     const agent = live?.agent;
-    if (!agent) return lane;
+    if (!agent) return member;
 
-    const paneId = typeof agent.pane_id === "string" ? agent.pane_id : lane.paneId;
-    const tabId = typeof agent.tab_id === "string" ? agent.tab_id : lane.tabId;
+    const paneId = typeof agent.pane_id === "string" ? agent.pane_id : member.paneId;
+    const tabId = typeof agent.tab_id === "string" ? agent.tab_id : member.tabId;
     const reported = agent.agent_session?.value;
-    const sessionPath = typeof reported === "string" && reported.startsWith("/") ? reported : lane.sessionPath;
+    const sessionPath = typeof reported === "string" && reported.startsWith("/") ? reported : member.sessionPath;
 
-    if (paneId === lane.paneId && tabId === lane.tabId && sessionPath === lane.sessionPath) return lane;
+    if (paneId === member.paneId && tabId === member.tabId && sessionPath === member.sessionPath) return member;
 
-    const refreshed: Lane = { ...lane, paneId, tabId, sessionPath };
+    const refreshed: Member = { ...member, paneId, tabId, sessionPath };
     persist(refreshed);
     return refreshed;
   }
@@ -206,9 +209,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * The workspace a lane belongs in.
+   * The workspace a member belongs in.
    *
-   * Group a lane by the repository it works on, not by the caller. A lane whose
+   * Group a member by the repository it works on, not by the caller. A member whose
    * cwd is another repository belongs beside that repository. The caller
    * workspace is the fallback for a directory outside any repository.
    */
@@ -223,16 +226,16 @@ export default function (pi: ExtensionAPI) {
     if (!held) return undefined;
 
     if (registry.openNames().includes(name)) {
-      throw new Error(`Lane "${name}" is already open in ${held.pane_id}. Use action "ask", or pick another name.`);
+      throw new Error(`Member "${name}" is already open in ${held.pane_id}. Use action "ask", or pick another name.`);
     }
 
     await herdr(exec, ["pane", "close", held.pane_id], { signal, timeoutMs: 30_000 });
     return held.pane_id;
   }
 
-  async function openLane(
+  async function openMember(
     params: {
-      lane: string;
+      member: string;
       cwd?: string;
       kind?: string;
       worktree?: boolean;
@@ -245,40 +248,38 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
-    const name = params.lane;
-    assertLaneName(name);
+    const name = params.member;
+    assertMemberName(name);
     if (registry.openNames().includes(name)) {
-      throw new Error(`Lane "${name}" is already open. Use action "ask" or pick another name.`);
+      throw new Error(`Member "${name}" is already open. Use action "ask" or pick another name.`);
     }
 
     const reclaimed = await reconcileName(name, signal);
     if (reclaimed) onUpdate?.(ok(`Reclaimed the name ${name} from orphan pane ${reclaimed}.`));
 
-    // The directory the parent asked for. A worktree lane then runs somewhere
-    // else, so laneCwd below is the value that matters for the file protocol.
+    // The directory the parent asked for. A worktree member then runs somewhere
+    // else, so memberCwd below is the value that matters for the file protocol.
     const cwd = params.cwd ? (params.cwd.startsWith("/") ? params.cwd : `${ctx.cwd}/${params.cwd}`) : ctx.cwd;
     const kind = params.kind ?? "pi";
     const layout = params.layout ?? "tab";
 
-    let laneCwd = cwd;
+    let memberCwd = cwd;
     let paneId: string;
     let workspaceId: string;
     let tabId: string | undefined;
-    let worktree: Lane["worktree"];
+    let worktree: Member["worktree"];
 
     if (params.worktree) {
       // Herdr groups a worktree workspace under the source repository. Pass the
       // source workspace so the new one lands beside its parent, not at the end
       // of the workspace list.
-      onUpdate?.(ok(`Creating a git worktree for lane ${name}...`));
+      onUpdate?.(ok(`Creating a git worktree for member ${name}...`));
+      // Prefer the source workspace, because Herdr groups the new workspace
+      // under that repository. A repository with no open workspace has no such
+      // id, and --cwd still works, so fall back instead of failing.
       const source = await sourceWorkspace(cwd, signal);
-      if (!source) {
-        throw new Error(
-          `${cwd} is not inside a Git work tree, so a worktree lane is impossible. ` +
-            `Open the lane without worktree true.`,
-        );
-      }
-      const args = ["worktree", "create", "--workspace", source, "--no-focus", "--branch", params.branch ?? `lane/${name}`];
+      const args = ["worktree", "create", "--no-focus", "--branch", params.branch ?? `crew/${name}`];
+      args.push(...(source ? ["--workspace", source] : ["--cwd", cwd]));
       if (params.base) args.push("--base", params.base);
 
       const result = await herdr(exec, args, { signal, timeoutMs: 120_000 });
@@ -291,13 +292,13 @@ export default function (pi: ExtensionAPI) {
         workspaceId: result.workspace.workspace_id,
         sourceWorkspaceId: source,
       };
-      // The lane runs in the worktree, not in the source checkout. Every brief
-      // and result must land where the lane can read and write them.
-      laneCwd = String(result.root_pane?.foreground_cwd ?? result.worktree.path);
+      // The member runs in the worktree, not in the source checkout. Every brief
+      // and result must land where the member can read and write them.
+      memberCwd = String(result.root_pane?.foreground_cwd ?? result.worktree.path);
     } else if (layout === "tab") {
-      // A tab gives the lane a full-width terminal in this workspace. A split
+      // A tab gives the member a full-width terminal in this workspace. A split
       // shrinks the caller, and a narrow pane truncates every agent UI.
-      onUpdate?.(ok(`Creating a tab for lane ${name}...`));
+      onUpdate?.(ok(`Creating a tab for member ${name}...`));
       const result = await herdr(
         exec,
         ["tab", "create", "--workspace", await targetWorkspace(cwd, signal), "--cwd", cwd, "--label", name, "--no-focus"],
@@ -307,7 +308,7 @@ export default function (pi: ExtensionAPI) {
       workspaceId = result.tab.workspace_id;
       tabId = result.tab.tab_id;
     } else {
-      onUpdate?.(ok(`Splitting a pane for lane ${name}...`));
+      onUpdate?.(ok(`Splitting a pane for member ${name}...`));
       const caller = callerPane();
       const direction = await pickDirection(exec, caller);
       const result = await herdr(
@@ -322,17 +323,17 @@ export default function (pi: ExtensionAPI) {
 
     onUpdate?.(ok(`Starting ${kind} in ${paneId}...`));
 
-    // A lane must never stop at the project trust dialog. That dialog blocks
+    // A member must never stop at the project trust dialog. That dialog blocks
     // startup in every new directory, and a worktree path is always new.
     // --no-approve ignores project-local files; --approve loads them.
     //
     // Use --name, not --session-id. A fresh id makes pi print "No project
     // session found with id ...; creating a new session with that id", which is
-    // noise on every lane start. The session path comes back from Herdr, so the
-    // lane never needs a predictable id. The name shows in the footer and the
+    // noise on every member start. The session path comes back from Herdr, so the
+    // member never needs a predictable id. The name shows in the footer and the
     // tab title instead.
     const trustFlag = params.trust ? "--approve" : "--no-approve";
-    const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `lane: ${name}`] : [];
+    const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `member: ${name}`] : [];
 
     let sessionPath: string;
     let status: string;
@@ -349,7 +350,7 @@ export default function (pi: ExtensionAPI) {
       sessionPath = reported;
       status = String(started.agent?.agent_status ?? "unknown");
     } catch (error) {
-      // Never leave an orphan pane. It also deadlocks the lane name.
+      // Never leave an orphan pane. It also deadlocks the member name.
       if (params.worktree && worktree) {
         await herdr(exec, ["worktree", "remove", "--workspace", worktree.workspaceId, "--force"], {
           timeoutMs: 30_000,
@@ -362,34 +363,34 @@ export default function (pi: ExtensionAPI) {
       throw error;
     }
 
-    const lane: Lane = {
+    const member: Member = {
       name, paneId, workspaceId, tabId, sessionPath, kind, worktree,
-      cwd: laneCwd,
+      cwd: memberCwd,
       layout: params.worktree ? "worktree" : layout,
       openedAt: new Date().toISOString(),
     };
-    persist(lane);
+    persist(member);
     refreshStatus(ctx);
 
     const lines = [
-      `Lane ${name} is open.`,
+      `Member ${name} is open.`,
       `  pane    ${paneId}   (workspace ${workspaceId}${tabId ? `, tab ${tabId}` : ""})`,
-      `  layout  ${lane.layout}`,
-      `  cwd     ${laneCwd}`,
+      `  layout  ${member.layout}`,
+      `  cwd     ${memberCwd}`,
       `  status  ${status}`,
     ];
     if (worktree) {
       lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
       if (worktree.sourceWorkspaceId) lines.push(`  under   ${worktree.sourceWorkspaceId}`);
     }
-    lines.push(`Next: call lane with action "ask".`);
+    lines.push(`Next: call crew with action "ask".`);
 
-    return ok(lines.join("\n"), { lane });
+    return ok(lines.join("\n"), { member });
   }
 
-  async function askLane(
+  async function askMember(
     params: {
-      lane: string;
+      member: string;
       task?: string;
       task_id?: string;
       timeout_ms?: number;
@@ -400,46 +401,46 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
-    const lane = await resolveLane(params.lane, signal);
+    const member = await resolveMember(params.member, signal);
     const task = params.task?.trim();
-    if (!task) throw new Error(`Action "ask" needs a task. Pass the full instruction; the lane cannot see this session.`);
+    if (!task) throw new Error(`Action "ask" needs a task. Pass the full instruction; the member cannot see this session.`);
     // An empty session path means the child never reached its prompt. A startup
     // dialog, above all project trust, is the usual cause. That dialog lives on
     // screen only, so the pane is the only place to see it.
-    if (!lane.sessionPath) {
+    if (!member.sessionPath) {
       return ok(
         [
-          `Lane ${lane.name} reports no session file, so a clean read is impossible.`,
-          `The lane most likely waits at a startup dialog. No task was sent.`,
-          `Answer it with action "keys", or close the lane and open a new one.`,
+          `Member ${member.name} reports no session file, so a clean read is impossible.`,
+          `The member most likely waits at a startup dialog. No task was sent.`,
+          `Answer it with action "keys", or close the member and open a new one.`,
           "",
           "Pane tail:",
-          await tailPane(lane.paneId, 25),
+          await tailPane(member.paneId, 25),
         ].join("\n"),
-        { blocked: true, lane: lane.name },
+        { blocked: true, member: member.name },
       );
     }
 
-    const baseline = (await readTranscript(lane.sessionPath).catch(() => undefined))?.turnCount ?? 0;
+    const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
 
     // The file protocol is the default. It keeps a large answer out of this
-    // context: the lane writes markdown to disk and replies with one line.
+    // context: the member writes markdown to disk and replies with one line.
     // Pass inline true for a short answer where a file costs more than it saves.
     const useFile = params.inline !== true;
 
-    // One directory per task, not per lane. A lane can run several tasks, and a
-    // task can outlive the lane that ran it.
-    const taskId = params.task_id ? slugify(params.task_id) : lane.task ?? lane.name;
-    const turn = taskId === lane.task ? (lane.turns ?? 0) + 1 : 1;
-    const paths = lanePaths(lane.cwd, taskId, turn);
+    // One directory per task, not per member. A member can run several tasks, and a
+    // task can outlive the member that ran it.
+    const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
+    const turn = taskId === member.task ? (member.turns ?? 0) + 1 : 1;
+    const paths = taskPaths(member.cwd, taskId, turn);
     let prompt = task;
 
     if (useFile) {
       await writeBrief(
         paths.brief,
         renderBrief({
-          lane: lane.name,
+          member: member.name,
           task,
           resultRelative: paths.resultRelative,
           dirRelative: paths.dirRelative,
@@ -447,39 +448,39 @@ export default function (pi: ExtensionAPI) {
         }),
       );
       prompt = renderPrompt(paths.briefRelative);
-      onUpdate?.(ok(`Wrote ${paths.briefRelative}. ${lane.name} is working...`));
+      onUpdate?.(ok(`Wrote ${paths.briefRelative}. ${member.name} is working...`));
     } else {
-      onUpdate?.(ok(`${lane.name} is working...`));
+      onUpdate?.(ok(`${member.name} is working...`));
     }
 
-    persist({ ...lane, task: taskId, turns: turn, lastResult: useFile ? paths.result : undefined });
+    persist({ ...member, task: taskId, turns: turn, lastResult: useFile ? paths.result : undefined });
 
     try {
-      await herdr(exec, ["agent", "prompt", lane.name, prompt, "--wait", "--timeout", String(timeout)], {
+      await herdr(exec, ["agent", "prompt", member.name, prompt, "--wait", "--timeout", String(timeout)], {
         signal,
         timeoutMs: timeout + 30_000,
       });
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
-        const tail = await tailPane(lane.paneId, 30);
+        const tail = await tailPane(member.paneId, 30);
         return ok(
           [
-            `Lane ${lane.name} waits at an approval or question dialog. No input was sent.`,
+            `Member ${member.name} waits at an approval or question dialog. No input was sent.`,
             `Ask the user how to answer it, then use action "keys".`,
             "",
             "Pane tail:",
             tail,
           ].join("\n"),
-          { blocked: true, lane: lane.name },
+          { blocked: true, member: member.name },
         );
       }
       throw error;
     }
 
-    const transcript = await awaitNewTurn(lane.sessionPath, baseline);
-    const state = await laneState(lane);
+    const transcript = await awaitNewTurn(member.sessionPath, baseline);
+    const state = await memberState(member);
     const meta = [
-      `lane=${lane.name}`,
+      `member=${member.name}`,
       `state=${state}`,
       transcript.lastDurationMs !== undefined ? `${Math.round(transcript.lastDurationMs / 1000)}s` : undefined,
       transcript.toolNames.length ? `tools=${transcript.toolNames.length}` : undefined,
@@ -491,28 +492,28 @@ export default function (pi: ExtensionAPI) {
     refreshStatus(ctx);
 
     if (useFile) {
-      const info = await inspectResult(paths.result, lane.cwd);
+      const info = await inspectResult(paths.result, member.cwd);
 
-      // A lane that ignored the brief still answered. Fall back to its reply
+      // A member that ignored the brief still answered. Fall back to its reply
       // instead of losing the work.
       if (!info.exists) {
         return ok(
           [
-            `Lane ${lane.name} wrote no ${info.relative}.`,
+            `Member ${member.name} wrote no ${info.relative}.`,
             transcript.final ? `Its reply follows.\n\n${transcript.final}` : `It produced no reply either.`,
             "",
             `--- ${meta} · no-result-file`,
           ].join("\n"),
-          { lane: lane.name, state, resultMissing: true },
+          { member: member.name, state, resultMissing: true },
         );
       }
 
-      const files = await listTaskFiles(lane.cwd, taskId);
+      const files = await listTaskFiles(member.cwd, taskId);
       const extras = files.filter((file) => !/^(brief|result)(-\d+)?\.md$/.test(file.name));
 
       return ok(
         [
-          transcript.final?.trim() || "(the lane sent no summary line)",
+          transcript.final?.trim() || "(the member sent no summary line)",
           "",
           `Result: ${info.relative} (${info.bytes} bytes, ${info.lines} lines)`,
           info.headings.length ? `Sections:\n${info.headings.map((h) => `  ${h}`).join("\n")}` : "",
@@ -523,52 +524,52 @@ export default function (pi: ExtensionAPI) {
         ]
           .filter((line) => line !== "")
           .join("\n"),
-        { lane: lane.name, state, task: taskId, result: info },
+        { member: member.name, state, task: taskId, result: info },
       );
     }
 
     if (!transcript.final) {
       return ok(
         [
-          `Lane ${lane.name} produced no assistant text (state: ${state}).`,
+          `Member ${member.name} produced no assistant text (state: ${state}).`,
           transcript.toolNames.length ? `Tools called: ${transcript.toolNames.join(", ")}` : "No tools were called.",
-          `Next: call lane with action "trace".`,
+          `Next: call crew with action "trace".`,
         ].join("\n"),
-        { lane: lane.name, state },
+        { member: member.name, state },
       );
     }
 
-    return ok(`${transcript.final}\n\n--- ${meta}`, { lane: lane.name, state, final: transcript.final });
+    return ok(`${transcript.final}\n\n--- ${meta}`, { member: member.name, state, final: transcript.final });
   }
 
   /**
-   * Describe or slice the lane's result file.
+   * Describe or slice the member's result file.
    *
    * Without a section name this returns the shape only, never the body. That is
    * the point: the parent decides what to pull in.
    */
-  async function resultLane(
-    params: { lane: string; section?: string; max_bytes?: number; task_id?: string },
+  async function readResult(
+    params: { member: string; section?: string; max_bytes?: number; task_id?: string },
     signal?: AbortSignal,
   ): Promise<ToolResult> {
-    const lane = await resolveLane(params.lane, signal);
+    const member = await resolveMember(params.member, signal);
 
-    // An adopted lane carries no memory of its last result. Disk holds it.
-    const taskId = params.task_id ? slugify(params.task_id) : lane.task ?? lane.name;
-    const path = lane.lastResult ?? (await findLatestResult(lane.cwd, taskId));
+    // An adopted member carries no memory of its last result. Disk holds it.
+    const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
+    const path = member.lastResult ?? (await findLatestResult(member.cwd, taskId));
     if (!path) {
       throw new Error(
-        `Lane ${lane.name} has no result file in ${lane.cwd}/.pi/lanes/${taskId}. ` +
+        `Member ${member.name} has no result file in ${member.cwd}/.pi/crew/${taskId}. ` +
           `Run action "ask" without inline true first.`,
       );
     }
-    if (path !== lane.lastResult) persist({ ...lane, lastResult: path });
+    if (path !== member.lastResult) persist({ ...member, lastResult: path });
 
-    const info: ResultInfo = await inspectResult(path, lane.cwd);
+    const info: ResultInfo = await inspectResult(path, member.cwd);
     if (!info.exists) throw new Error(`Result file ${info.relative} does not exist.`);
 
     if (!params.section) {
-      const files = await listTaskFiles(lane.cwd, taskId);
+      const files = await listTaskFiles(member.cwd, taskId);
       return ok(
         [
           `${info.relative} · ${info.bytes} bytes · ${info.lines} lines`,
@@ -578,12 +579,12 @@ export default function (pi: ExtensionAPI) {
         ]
           .filter((line) => line !== "")
           .join("\n"),
-        { lane: lane.name, task: taskId, result: info },
+        { member: member.name, task: taskId, result: info },
       );
     }
 
     const body = await readSection(path, { section: params.section, maxBytes: params.max_bytes });
-    return ok(body, { lane: lane.name, section: params.section });
+    return ok(body, { member: member.name, section: params.section });
   }
 
   /**
@@ -592,7 +593,7 @@ export default function (pi: ExtensionAPI) {
    * A pane from `tab create` or `worktree create` is not immediately at its
    * prompt. `agent start` then fails with agent_pane_busy or
    * agent_pane_not_available. Measured on this machine, the shell needs about
-   * one second. Retry instead of failing the lane.
+   * one second. Retry instead of failing the member.
    */
   async function startAgent(
     name: string,
@@ -622,17 +623,17 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** True when the lane pane is the only pane in its tab, so closing the tab is right. */
-  async function ownsWholeTab(lane: Lane, signal?: AbortSignal): Promise<boolean> {
-    if (!lane.tabId) return false;
-    const result = await herdr(exec, ["tab", "get", lane.tabId], { signal, timeoutMs: 10_000 }).catch(() => undefined);
+  /** True when the member pane is the only pane in its tab, so closing the tab is right. */
+  async function ownsWholeTab(member: Member, signal?: AbortSignal): Promise<boolean> {
+    if (!member.tabId) return false;
+    const result = await herdr(exec, ["tab", "get", member.tabId], { signal, timeoutMs: 10_000 }).catch(() => undefined);
     return Number(result?.tab?.pane_count ?? 0) === 1;
   }
 
   /** Live status straight from Herdr. Never cached. */
-  async function laneState(lane: Lane): Promise<string> {
+  async function memberState(member: Member): Promise<string> {
     try {
-      const result = await herdr(exec, ["agent", "get", lane.name], { timeoutMs: 10_000 });
+      const result = await herdr(exec, ["agent", "get", member.name], { timeoutMs: 10_000 });
       return String(result.agent?.agent_status ?? "unknown");
     } catch {
       return "gone";
@@ -660,141 +661,141 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function statusLanes(ctx: ExtensionContext, signal?: AbortSignal): Promise<ToolResult> {
-    await adoptLanes(signal);
+  async function statusCrew(ctx: ExtensionContext, signal?: AbortSignal): Promise<ToolResult> {
+    await adoptMembers(signal);
 
-    const open = registry.openLanes();
-    if (!open.length) return ok(`No lane is open. Use action "open".`);
+    const open = registry.openMembers();
+    if (!open.length) return ok(`No member is open. Use action "open".`);
 
     const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
     const byPane = new Map<string, any>((live.agents ?? []).map((a: any) => [a.pane_id, a]));
 
-    const rows = open.map((lane) => {
-      const agent = byPane.get(lane.paneId);
+    const rows = open.map((member) => {
+      const agent = byPane.get(member.paneId);
       const state = agent ? String(agent.agent_status) : "gone";
       const flag =
         state === "blocked"
           ? " <- needs input"
           : state === "gone"
             ? " <- pane lost"
-            : lane.adopted
+            : member.adopted
               ? " <- adopted"
               : "";
-      return `${lane.name.padEnd(16)} ${state.padEnd(8)} ${lane.paneId.padEnd(8)} ${lane.worktree?.branch ?? lane.cwd}${flag}`;
+      return `${member.name.padEnd(16)} ${state.padEnd(8)} ${member.paneId.padEnd(8)} ${member.worktree?.branch ?? member.cwd}${flag}`;
     });
 
     refreshStatus(ctx);
-    return ok([`${open.length} lane(s):`, ...rows].join("\n"), { lanes: open.map((l) => l.name) });
+    return ok([`${open.length} member(s):`, ...rows].join("\n"), { members: open.map((m) => m.name) });
   }
 
-  async function traceLane(params: { lane: string; lines?: number }, signal?: AbortSignal): Promise<ToolResult> {
-    const lane = await resolveLane(params.lane, signal);
-    if (!lane.sessionPath) return ok(`Lane ${lane.name} has no session file. Pane tail:\n${await tailPane(lane.paneId, 25)}`);
-    const transcript = await readTranscript(lane.sessionPath);
-    const state = await laneState(lane);
+  async function traceMember(params: { member: string; lines?: number }, signal?: AbortSignal): Promise<ToolResult> {
+    const member = await resolveMember(params.member, signal);
+    if (!member.sessionPath) return ok(`Member ${member.name} has no session file. Pane tail:\n${await tailPane(member.paneId, 25)}`);
+    const transcript = await readTranscript(member.sessionPath);
+    const state = await memberState(member);
     return ok(
-      [`Lane ${lane.name} (state: ${state}, ${transcript.turnCount} turn(s)):`, formatTrace(transcript, params.lines ?? 40)].join("\n"),
-      { lane: lane.name, state },
+      [`Member ${member.name} (state: ${state}, ${transcript.turnCount} turn(s)):`, formatTrace(transcript, params.lines ?? 40)].join("\n"),
+      { member: member.name, state },
     );
   }
 
-  async function keysLane(params: { lane: string; keys?: string[] }, signal?: AbortSignal): Promise<ToolResult> {
-    const lane = await resolveLane(params.lane, signal);
+  async function keysMember(params: { member: string; keys?: string[] }, signal?: AbortSignal): Promise<ToolResult> {
+    const member = await resolveMember(params.member, signal);
     const keys = params.keys ?? [];
     if (!keys.length) throw new Error(`Action "keys" needs at least one logical key, for example ["esc"] or ["ctrl+c"].`);
 
-    await herdr(exec, ["agent", "send-keys", lane.name, ...keys], { signal, timeoutMs: 15_000 });
+    await herdr(exec, ["agent", "send-keys", member.name, ...keys], { signal, timeoutMs: 15_000 });
     await sleep(400);
-    return ok([`Sent ${keys.join(" ")} to ${lane.name}. State: ${await laneState(lane)}.`, "", await tailPane(lane.paneId, 20)].join("\n"));
+    return ok([`Sent ${keys.join(" ")} to ${member.name}. State: ${await memberState(member)}.`, "", await tailPane(member.paneId, 20)].join("\n"));
   }
 
-  async function closeLane(
-    params: { lane: string; force?: boolean },
+  async function closeMember(
+    params: { member: string; force?: boolean },
     ctx: ExtensionContext,
     signal?: AbortSignal,
   ): Promise<ToolResult> {
-    const lane = await resolveLane(params.lane, signal);
+    const member = await resolveMember(params.member, signal);
     const notes: string[] = [];
 
-    if (lane.worktree) {
-      const args = ["worktree", "remove", "--workspace", lane.worktree.workspaceId];
+    if (member.worktree) {
+      const args = ["worktree", "remove", "--workspace", member.worktree.workspaceId];
       if (params.force) args.push("--force");
       try {
         await herdr(exec, args, { signal, timeoutMs: 60_000 });
-        notes.push(`Removed the worktree at ${lane.worktree.path}.`);
-        notes.push(`Branch ${lane.worktree.branch} still exists. Herdr does not delete it.`);
+        notes.push(`Removed the worktree at ${member.worktree.path}.`);
+        notes.push(`Branch ${member.worktree.branch} still exists. Herdr does not delete it.`);
       } catch (error) {
         if (error instanceof HerdrError && error.code === "dirty_worktree_requires_force") {
           return ok(
             [
-              `Lane ${lane.name} has uncommitted work in ${lane.worktree.path}.`,
-              `The lane stays open. Commit or merge that work first.`,
+              `Member ${member.name} has uncommitted work in ${member.worktree.path}.`,
+              `The member stays open. Commit or merge that work first.`,
               `To discard it, call action "close" again with force true.`,
             ].join("\n"),
-            { dirty: true, lane: lane.name },
+            { dirty: true, member: member.name },
           );
         }
         throw error;
       }
-    } else if (await ownsWholeTab(lane, signal)) {
-      // Close the tab when the lane is its only pane. Decide from live state, not
-      // from the stored layout, because an adopted lane has no stored layout.
-      const tabId = lane.tabId as string;
+    } else if (await ownsWholeTab(member, signal)) {
+      // Close the tab when the member is its only pane. Decide from live state, not
+      // from the stored layout, because an adopted member has no stored layout.
+      const tabId = member.tabId as string;
       await herdr(exec, ["tab", "close", tabId], { signal, timeoutMs: 30_000 });
       notes.push(`Closed tab ${tabId}.`);
     } else {
-      await herdr(exec, ["pane", "close", lane.paneId], { signal, timeoutMs: 30_000 });
-      notes.push(`Closed pane ${lane.paneId}.`);
+      await herdr(exec, ["pane", "close", member.paneId], { signal, timeoutMs: 30_000 });
+      notes.push(`Closed pane ${member.paneId}.`);
     }
 
-    registry.markClosed(lane.name);
-    pi.appendEntry(LANE_ENTRY, { ...lane, closed: true });
+    registry.markClosed(member.name);
+    pi.appendEntry(CREW_ENTRY, { ...member, closed: true });
     refreshStatus(ctx);
 
-    if (lane.sessionPath) notes.push(`Transcript stays readable at ${lane.sessionPath}.`);
-    return ok([`Lane ${lane.name} is closed.`, ...notes].join("\n"));
+    if (member.sessionPath) notes.push(`Transcript stays readable at ${member.sessionPath}.`);
+    return ok([`Member ${member.name} is closed.`, ...notes].join("\n"));
   }
 
   // ---------------------------------------------------------------- tool
 
   pi.registerTool({
-    name: "lane",
-    label: "Lane",
+    name: "crew",
+    label: "Crew",
     description:
-      "Dispatch work to a pi subagent running in a visible Herdr pane. The lane writes its answer to a markdown " +
+      "Dispatch work to a pi subagent running in a visible Herdr pane. The member writes its answer to a markdown " +
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
-      "  open   - create a tab (or a git worktree) and start an agent under a lane name\n" +
+      "  open   - create a tab (or a git worktree) and start an agent under a member name\n" +
       "  ask    - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
       "  result - list the result file sections, or return one named section\n" +
-      "  status - one line per lane with live Herdr state: idle, working, blocked, done\n" +
-      "  trace  - the lane's tool calls and messages in order, for a lane that answered badly\n" +
-      "  keys   - send logical keys such as esc or ctrl+c to a blocked lane\n" +
+      "  status - one line per member with live Herdr state: idle, working, blocked, done\n" +
+      "  trace  - the member's tool calls and messages in order, for a member that answered badly\n" +
+      "  keys   - send logical keys such as esc or ctrl+c to a blocked member\n" +
       "  close  - close the pane, or remove the worktree\n" +
-      "A lane cannot see this conversation. Put every needed fact in the task text.",
+      "A member cannot see this conversation. Put every needed fact in the task text.",
     promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
-      "Use lane with action open then ask when work should run in a visible pane the user can take over by typing in it.",
-      "Use lane with worktree true when two or more lanes write files, because one directory tolerates one writer only.",
-      "Pass a task_id to lane action ask when one lane runs several tasks, because each task_id gets its own directory.",
-      "Restate every needed fact in the lane task text, because a lane starts with an empty conversation.",
-      "Let lane action ask use its default file protocol for a long answer, then pull one section with action result.",
-      "Use lane with inline true only for a one-line answer, where a result file costs more than it saves.",
-      "Trust only idle and done from lane action status; unknown does not prove that a lane finished.",
-      "Use lane with action trace, not the terminal, when a lane answers badly.",
+      "Use crew with action open then ask when work should run in a visible pane the user can take over by typing in it.",
+      "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
+      "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
+      "Restate every needed fact in the crew task text, because a member starts with an empty conversation.",
+      "Let crew action ask use its default file protocol for a long answer, then pull one section with action result.",
+      "Use crew with inline true only for a one-line answer, where a result file costs more than it saves.",
+      "Trust only idle and done from crew action status; unknown does not prove that a member finished.",
+      "Use crew with action trace, not the terminal, when a member answers badly.",
     ],
     parameters: Type.Object({
       action: StringEnum(["open", "ask", "result", "status", "trace", "keys", "close"] as const, {
-        description: "The lane operation to run.",
+        description: "The member operation to run.",
       }),
-      lane: Type.Optional(
+      member: Type.Optional(
         Type.String({
-          description: 'Lane name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status.',
+          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status.',
         }),
       ),
       task: Type.Optional(
         Type.String({
-          description: "For ask: the full self-contained instruction. The lane cannot see this conversation.",
+          description: "For ask: the full self-contained instruction. The member cannot see this conversation.",
         }),
       ),
       context: Type.Optional(
@@ -805,7 +806,7 @@ export default function (pi: ExtensionAPI) {
       inline: Type.Optional(
         Type.Boolean({
           description:
-            "For ask: skip the result file and return the lane's reply directly. Use it for a one-line answer only.",
+            "For ask: skip the result file and return the member's reply directly. Use it for a one-line answer only.",
         }),
       ),
       section: Type.Optional(
@@ -820,13 +821,13 @@ export default function (pi: ExtensionAPI) {
       layout: Type.Optional(
         StringEnum(["tab", "split"] as const, {
           description:
-            'For open: "tab" gives the lane a full-width tab and is the default. "split" shares the caller tab.',
+            'For open: "tab" gives the member a full-width tab and is the default. "split" shares the caller tab.',
         }),
       ),
       task_id: Type.Optional(
         Type.String({
           description:
-            "For ask and result: task name, which becomes the directory .pi/lanes/<task_id>/. Defaults to the lane name.",
+            "For ask and result: task name, which becomes the directory .pi/crew/<task_id>/. Defaults to the member name.",
         }),
       ),
       kind: Type.Optional(
@@ -834,54 +835,54 @@ export default function (pi: ExtensionAPI) {
       ),
       worktree: Type.Optional(
         Type.Boolean({
-          description: "For open: create an isolated git worktree and workspace. Use this for a lane that writes files.",
+          description: "For open: create an isolated git worktree and workspace. Use this for a member that writes files.",
         }),
       ),
       trust: Type.Optional(
         Type.Boolean({
           description:
-            "For open: load project-local .pi settings and extensions in the lane. Defaults to false, which ignores them.",
+            "For open: load project-local .pi settings and extensions in the member. Defaults to false, which ignores them.",
         }),
       ),
-      branch: Type.Optional(Type.String({ description: "For open with worktree: branch name. Defaults to lane/<name>." })),
+      branch: Type.Optional(Type.String({ description: "For open with worktree: branch name. Defaults to crew/<name>." })),
       base: Type.Optional(Type.String({ description: "For open with worktree: base ref for the new branch." })),
       keys: Type.Optional(
         Type.Array(Type.String(), { description: 'For keys: logical keys in order, for example ["esc"] or ["ctrl+c"].' }),
       ),
       lines: Type.Optional(Type.Number({ description: "For trace: maximum lines to return. Defaults to 40." })),
       timeout_ms: Type.Optional(Type.Number({ description: "For ask: wait budget in milliseconds. Defaults to 600000." })),
-      force: Type.Optional(Type.Boolean({ description: "For close: discard uncommitted work in a worktree lane." })),
+      force: Type.Optional(Type.Boolean({ description: "For close: discard uncommitted work in a worktree member." })),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!inHerdr()) {
         throw new Error(
-          "This pi session does not run inside a Herdr pane, so lane cannot control panes. Start pi inside Herdr.",
+          "This pi session does not run inside a Herdr pane, so member cannot control panes. Start pi inside Herdr.",
         );
       }
 
-      const needsLane = params.action !== "status";
-      if (needsLane && !params.lane) throw new Error(`Action "${params.action}" needs a lane name.`);
-      const name = params.lane as string;
+      const needsMember = params.action !== "status";
+      if (needsMember && !params.member) throw new Error(`Action "${params.action}" needs a member name.`);
+      const name = params.member as string;
 
       switch (params.action) {
         case "open":
-          return openLane({ ...params, lane: name }, ctx, signal, onUpdate);
+          return openMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "ask":
-          return askLane({ ...params, lane: name }, ctx, signal, onUpdate);
+          return askMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "result":
-          return resultLane(
-            { lane: name, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
+          return readResult(
+            { member: name, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
             signal,
           );
         case "status":
-          return statusLanes(ctx, signal);
+          return statusCrew(ctx, signal);
         case "trace":
-          return traceLane({ lane: name, lines: params.lines }, signal);
+          return traceMember({ member: name, lines: params.lines }, signal);
         case "keys":
-          return keysLane({ lane: name, keys: params.keys }, signal);
+          return keysMember({ member: name, keys: params.keys }, signal);
         case "close":
-          return closeLane({ lane: name, force: params.force }, ctx, signal);
+          return closeMember({ member: name, force: params.force }, ctx, signal);
         default:
           throw new Error(`Unknown action "${params.action}".`);
       }
@@ -889,9 +890,9 @@ export default function (pi: ExtensionAPI) {
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      let content = theme.fg("toolTitle", theme.bold("lane "));
+      let content = theme.fg("toolTitle", theme.bold("crew "));
       content += theme.fg("accent", String(args?.action ?? "?"));
-      if (args?.lane) content += " " + theme.fg("muted", String(args.lane));
+      if (args?.member) content += " " + theme.fg("muted", String(args.member));
       if (args?.worktree) content += " " + theme.fg("dim", "[worktree]");
       if (args?.task) {
         const task = String(args.task).replace(/\s+/g, " ");
@@ -917,8 +918,8 @@ export default function (pi: ExtensionAPI) {
 
   // -------------------------------------------------------------- command
 
-  pi.registerCommand("lanes", {
-    description: "List open Herdr lanes, or close them all with /lanes close",
+  pi.registerCommand("crew", {
+    description: "List the open crew, or close every member with /crew close",
     handler: async (args, ctx) => {
       if (!inHerdr()) {
         ctx.ui.notify("Not running inside Herdr.", "error");
@@ -926,23 +927,23 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (args.trim() === "close") {
-        const open = registry.openLanes();
+        const open = registry.openMembers();
         if (!open.length) {
-          ctx.ui.notify("No lane is open.", "info");
+          ctx.ui.notify("No member is open.", "info");
           return;
         }
-        const confirmed = await ctx.ui.confirm("Close lanes", `Close ${open.length} lane(s)?`);
+        const confirmed = await ctx.ui.confirm("Close members", `Close ${open.length} member(s)?`);
         if (!confirmed) return;
-        for (const lane of open) {
-          await closeLane({ lane: lane.name }, ctx).catch((error: Error) =>
-            ctx.ui.notify(`${lane.name}: ${error.message}`, "error"),
+        for (const member of open) {
+          await closeMember({ member: member.name }, ctx).catch((error: Error) =>
+            ctx.ui.notify(`${member.name}: ${error.message}`, "error"),
           );
         }
-        ctx.ui.notify("Lanes closed.", "info");
+        ctx.ui.notify("Members closed.", "info");
         return;
       }
 
-      const result = await statusLanes(ctx);
+      const result = await statusCrew(ctx);
       ctx.ui.notify(result.content[0]!.text, "info");
     },
   });
