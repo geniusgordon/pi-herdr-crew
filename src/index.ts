@@ -19,13 +19,34 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { HerdrError, callerPane, herdr, herdrText, inHerdr, pickDirection, type Exec } from "./herdr.js";
+import {
+  HerdrError,
+  callerPane,
+  callerWorkspace,
+  herdr,
+  herdrText,
+  inHerdr,
+  pickDirection,
+  type Exec,
+} from "./herdr.js";
+import {
+  findLatestResult,
+  inspectResult,
+  lanePaths,
+  listTaskFiles,
+  readSection,
+  renderBrief,
+  renderPrompt,
+  writeBrief,
+  type ResultInfo,
+} from "./protocol.js";
 import { LANE_ENTRY, LaneRegistry, assertLaneName, type Lane } from "./registry.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const DEFAULT_ASK_TIMEOUT_MS = 600_000;
 const START_TIMEOUT_MS = 60_000;
 const TRANSCRIPT_SETTLE_MS = 8_000;
+const SHELL_READY_TIMEOUT_MS = 15_000;
 const SETTLED = new Set(["idle", "done", "blocked"]);
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
@@ -34,8 +55,16 @@ function ok(text: string, details?: unknown): ToolResult {
   return { content: [{ type: "text", text }], details };
 }
 
-function runId(): string {
-  return Math.random().toString(36).slice(2, 8);
+/** Make a task id safe as one directory name. */
+function slugify(raw: string): string {
+  const slug = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  if (!slug) throw new Error(`Task id "${raw}" has no usable characters. Use letters, digits, and dashes.`);
+  return slug;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -106,6 +135,7 @@ export default function (pi: ExtensionAPI) {
         name,
         paneId: String(agent.pane_id),
         workspaceId: String(agent.workspace_id),
+        tabId: typeof agent.tab_id === "string" ? agent.tab_id : undefined,
         sessionPath: typeof sessionPath === "string" && sessionPath.startsWith("/") ? sessionPath : "",
         cwd: String(agent.cwd ?? ""),
         kind: String(agent.agent ?? "pi"),
@@ -149,14 +179,41 @@ export default function (pi: ExtensionAPI) {
     if (!agent) return lane;
 
     const paneId = typeof agent.pane_id === "string" ? agent.pane_id : lane.paneId;
+    const tabId = typeof agent.tab_id === "string" ? agent.tab_id : lane.tabId;
     const reported = agent.agent_session?.value;
     const sessionPath = typeof reported === "string" && reported.startsWith("/") ? reported : lane.sessionPath;
 
-    if (paneId === lane.paneId && sessionPath === lane.sessionPath) return lane;
+    if (paneId === lane.paneId && tabId === lane.tabId && sessionPath === lane.sessionPath) return lane;
 
-    const refreshed: Lane = { ...lane, paneId, sessionPath };
+    const refreshed: Lane = { ...lane, paneId, tabId, sessionPath };
     persist(refreshed);
     return refreshed;
+  }
+
+  /**
+   * The workspace that owns a repository checkout.
+   *
+   * Herdr has no parent field. `worktree list` reports `source_workspace_id`
+   * instead, which is the workspace holding the main checkout. Passing it to
+   * `worktree create` groups the new workspace under that repository.
+   */
+  async function sourceWorkspace(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+    const list = await herdr(exec, ["worktree", "list", "--cwd", cwd], { signal, timeoutMs: 15_000 }).catch(
+      () => undefined,
+    );
+    const source = list?.source?.source_workspace_id;
+    return typeof source === "string" && source ? source : undefined;
+  }
+
+  /**
+   * The workspace a lane belongs in.
+   *
+   * Group a lane by the repository it works on, not by the caller. A lane whose
+   * cwd is another repository belongs beside that repository. The caller
+   * workspace is the fallback for a directory outside any repository.
+   */
+  async function targetWorkspace(cwd: string, signal?: AbortSignal): Promise<string> {
+    return (await sourceWorkspace(cwd, signal)) ?? callerWorkspace();
   }
 
   /** Clear a name Herdr still holds after a failed open, instead of deadlocking on it. */
@@ -182,6 +239,7 @@ export default function (pi: ExtensionAPI) {
       branch?: string;
       base?: string;
       trust?: boolean;
+      layout?: "tab" | "split";
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -196,27 +254,58 @@ export default function (pi: ExtensionAPI) {
     const reclaimed = await reconcileName(name, signal);
     if (reclaimed) onUpdate?.(ok(`Reclaimed the name ${name} from orphan pane ${reclaimed}.`));
 
+    // The directory the parent asked for. A worktree lane then runs somewhere
+    // else, so laneCwd below is the value that matters for the file protocol.
     const cwd = params.cwd ? (params.cwd.startsWith("/") ? params.cwd : `${ctx.cwd}/${params.cwd}`) : ctx.cwd;
     const kind = params.kind ?? "pi";
-    const id = runId();
+    const layout = params.layout ?? "tab";
 
+    let laneCwd = cwd;
     let paneId: string;
     let workspaceId: string;
+    let tabId: string | undefined;
     let worktree: Lane["worktree"];
 
     if (params.worktree) {
+      // Herdr groups a worktree workspace under the source repository. Pass the
+      // source workspace so the new one lands beside its parent, not at the end
+      // of the workspace list.
       onUpdate?.(ok(`Creating a git worktree for lane ${name}...`));
-      const args = ["worktree", "create", "--cwd", cwd, "--no-focus", "--branch", params.branch ?? `lane/${name}`];
+      const source = await sourceWorkspace(cwd, signal);
+      if (!source) {
+        throw new Error(
+          `${cwd} is not inside a Git work tree, so a worktree lane is impossible. ` +
+            `Open the lane without worktree true.`,
+        );
+      }
+      const args = ["worktree", "create", "--workspace", source, "--no-focus", "--branch", params.branch ?? `lane/${name}`];
       if (params.base) args.push("--base", params.base);
 
       const result = await herdr(exec, args, { signal, timeoutMs: 120_000 });
       paneId = result.root_pane.pane_id;
       workspaceId = result.workspace.workspace_id;
+      tabId = result.tab?.tab_id;
       worktree = {
         path: result.worktree.path,
         branch: result.worktree.branch,
         workspaceId: result.workspace.workspace_id,
+        sourceWorkspaceId: source,
       };
+      // The lane runs in the worktree, not in the source checkout. Every brief
+      // and result must land where the lane can read and write them.
+      laneCwd = String(result.root_pane?.foreground_cwd ?? result.worktree.path);
+    } else if (layout === "tab") {
+      // A tab gives the lane a full-width terminal in this workspace. A split
+      // shrinks the caller, and a narrow pane truncates every agent UI.
+      onUpdate?.(ok(`Creating a tab for lane ${name}...`));
+      const result = await herdr(
+        exec,
+        ["tab", "create", "--workspace", await targetWorkspace(cwd, signal), "--cwd", cwd, "--label", name, "--no-focus"],
+        { signal, timeoutMs: 30_000 },
+      );
+      paneId = result.root_pane.pane_id;
+      workspaceId = result.tab.workspace_id;
+      tabId = result.tab.tab_id;
     } else {
       onUpdate?.(ok(`Splitting a pane for lane ${name}...`));
       const caller = callerPane();
@@ -228,6 +317,7 @@ export default function (pi: ExtensionAPI) {
       );
       paneId = result.pane.pane_id;
       workspaceId = result.pane.workspace_id;
+      tabId = result.pane.tab_id;
     }
 
     onUpdate?.(ok(`Starting ${kind} in ${paneId}...`));
@@ -235,17 +325,19 @@ export default function (pi: ExtensionAPI) {
     // A lane must never stop at the project trust dialog. That dialog blocks
     // startup in every new directory, and a worktree path is always new.
     // --no-approve ignores project-local files; --approve loads them.
+    //
+    // Use --name, not --session-id. A fresh id makes pi print "No project
+    // session found with id ...; creating a new session with that id", which is
+    // noise on every lane start. The session path comes back from Herdr, so the
+    // lane never needs a predictable id. The name shows in the footer and the
+    // tab title instead.
     const trustFlag = params.trust ? "--approve" : "--no-approve";
-    const childArgs = kind === "pi" ? ["--", "--session-id", `lane-${name}-${id}`, trustFlag] : [];
+    const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `lane: ${name}`] : [];
 
     let sessionPath: string;
     let status: string;
     try {
-      const started = await herdr(
-        exec,
-        ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", String(START_TIMEOUT_MS), ...childArgs],
-        { signal, timeoutMs: START_TIMEOUT_MS + 15_000 },
-      );
+      const started = await startAgent(name, kind, paneId, childArgs, signal);
 
       const reported = started.agent?.agent_session?.value;
       if (typeof reported !== "string" || !reported.startsWith("/")) {
@@ -262,6 +354,8 @@ export default function (pi: ExtensionAPI) {
         await herdr(exec, ["worktree", "remove", "--workspace", worktree.workspaceId, "--force"], {
           timeoutMs: 30_000,
         }).catch(() => {});
+      } else if (layout === "tab" && tabId) {
+        await herdr(exec, ["tab", "close", tabId], { timeoutMs: 15_000 }).catch(() => {});
       } else {
         await herdr(exec, ["pane", "close", paneId], { timeoutMs: 15_000 }).catch(() => {});
       }
@@ -269,7 +363,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const lane: Lane = {
-      name, paneId, workspaceId, sessionPath, cwd, kind, worktree,
+      name, paneId, workspaceId, tabId, sessionPath, kind, worktree,
+      cwd: laneCwd,
+      layout: params.worktree ? "worktree" : layout,
       openedAt: new Date().toISOString(),
     };
     persist(lane);
@@ -277,18 +373,29 @@ export default function (pi: ExtensionAPI) {
 
     const lines = [
       `Lane ${name} is open.`,
-      `  pane    ${paneId}   (workspace ${workspaceId})`,
-      `  cwd     ${cwd}`,
+      `  pane    ${paneId}   (workspace ${workspaceId}${tabId ? `, tab ${tabId}` : ""})`,
+      `  layout  ${lane.layout}`,
+      `  cwd     ${laneCwd}`,
       `  status  ${status}`,
     ];
-    if (worktree) lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
+    if (worktree) {
+      lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
+      if (worktree.sourceWorkspaceId) lines.push(`  under   ${worktree.sourceWorkspaceId}`);
+    }
     lines.push(`Next: call lane with action "ask".`);
 
     return ok(lines.join("\n"), { lane });
   }
 
   async function askLane(
-    params: { lane: string; task?: string; timeout_ms?: number },
+    params: {
+      lane: string;
+      task?: string;
+      task_id?: string;
+      timeout_ms?: number;
+      inline?: boolean;
+      context?: string;
+    },
     ctx: ExtensionContext,
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
@@ -316,10 +423,39 @@ export default function (pi: ExtensionAPI) {
     const baseline = (await readTranscript(lane.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
 
-    onUpdate?.(ok(`${lane.name} is working...`));
+    // The file protocol is the default. It keeps a large answer out of this
+    // context: the lane writes markdown to disk and replies with one line.
+    // Pass inline true for a short answer where a file costs more than it saves.
+    const useFile = params.inline !== true;
+
+    // One directory per task, not per lane. A lane can run several tasks, and a
+    // task can outlive the lane that ran it.
+    const taskId = params.task_id ? slugify(params.task_id) : lane.task ?? lane.name;
+    const turn = taskId === lane.task ? (lane.turns ?? 0) + 1 : 1;
+    const paths = lanePaths(lane.cwd, taskId, turn);
+    let prompt = task;
+
+    if (useFile) {
+      await writeBrief(
+        paths.brief,
+        renderBrief({
+          lane: lane.name,
+          task,
+          resultRelative: paths.resultRelative,
+          dirRelative: paths.dirRelative,
+          context: params.context,
+        }),
+      );
+      prompt = renderPrompt(paths.briefRelative);
+      onUpdate?.(ok(`Wrote ${paths.briefRelative}. ${lane.name} is working...`));
+    } else {
+      onUpdate?.(ok(`${lane.name} is working...`));
+    }
+
+    persist({ ...lane, task: taskId, turns: turn, lastResult: useFile ? paths.result : undefined });
 
     try {
-      await herdr(exec, ["agent", "prompt", lane.name, task, "--wait", "--timeout", String(timeout)], {
+      await herdr(exec, ["agent", "prompt", lane.name, prompt, "--wait", "--timeout", String(timeout)], {
         signal,
         timeoutMs: timeout + 30_000,
       });
@@ -342,6 +478,54 @@ export default function (pi: ExtensionAPI) {
 
     const transcript = await awaitNewTurn(lane.sessionPath, baseline);
     const state = await laneState(lane);
+    const meta = [
+      `lane=${lane.name}`,
+      `state=${state}`,
+      transcript.lastDurationMs !== undefined ? `${Math.round(transcript.lastDurationMs / 1000)}s` : undefined,
+      transcript.toolNames.length ? `tools=${transcript.toolNames.length}` : undefined,
+      transcript.inputTokens !== undefined ? `↑${transcript.inputTokens} ↓${transcript.outputTokens}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    refreshStatus(ctx);
+
+    if (useFile) {
+      const info = await inspectResult(paths.result, lane.cwd);
+
+      // A lane that ignored the brief still answered. Fall back to its reply
+      // instead of losing the work.
+      if (!info.exists) {
+        return ok(
+          [
+            `Lane ${lane.name} wrote no ${info.relative}.`,
+            transcript.final ? `Its reply follows.\n\n${transcript.final}` : `It produced no reply either.`,
+            "",
+            `--- ${meta} · no-result-file`,
+          ].join("\n"),
+          { lane: lane.name, state, resultMissing: true },
+        );
+      }
+
+      const files = await listTaskFiles(lane.cwd, taskId);
+      const extras = files.filter((file) => !/^(brief|result)(-\d+)?\.md$/.test(file.name));
+
+      return ok(
+        [
+          transcript.final?.trim() || "(the lane sent no summary line)",
+          "",
+          `Result: ${info.relative} (${info.bytes} bytes, ${info.lines} lines)`,
+          info.headings.length ? `Sections:\n${info.headings.map((h) => `  ${h}`).join("\n")}` : "",
+          extras.length ? `Also in ${paths.dirRelative}/: ${extras.map((f) => `${f.name} (${f.bytes}B)`).join(", ")}` : "",
+          `Read one section with action "result" and a section name, or read the file directly.`,
+          "",
+          `--- ${meta}`,
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+        { lane: lane.name, state, task: taskId, result: info },
+      );
+    }
 
     if (!transcript.final) {
       return ok(
@@ -354,18 +538,95 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    const meta = [
-      `lane=${lane.name}`,
-      `state=${state}`,
-      transcript.lastDurationMs !== undefined ? `${Math.round(transcript.lastDurationMs / 1000)}s` : undefined,
-      transcript.toolNames.length ? `tools=${transcript.toolNames.length}` : undefined,
-      transcript.inputTokens !== undefined ? `↑${transcript.inputTokens} ↓${transcript.outputTokens}` : undefined,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-
-    refreshStatus(ctx);
     return ok(`${transcript.final}\n\n--- ${meta}`, { lane: lane.name, state, final: transcript.final });
+  }
+
+  /**
+   * Describe or slice the lane's result file.
+   *
+   * Without a section name this returns the shape only, never the body. That is
+   * the point: the parent decides what to pull in.
+   */
+  async function resultLane(
+    params: { lane: string; section?: string; max_bytes?: number; task_id?: string },
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    const lane = await resolveLane(params.lane, signal);
+
+    // An adopted lane carries no memory of its last result. Disk holds it.
+    const taskId = params.task_id ? slugify(params.task_id) : lane.task ?? lane.name;
+    const path = lane.lastResult ?? (await findLatestResult(lane.cwd, taskId));
+    if (!path) {
+      throw new Error(
+        `Lane ${lane.name} has no result file in ${lane.cwd}/.pi/lanes/${taskId}. ` +
+          `Run action "ask" without inline true first.`,
+      );
+    }
+    if (path !== lane.lastResult) persist({ ...lane, lastResult: path });
+
+    const info: ResultInfo = await inspectResult(path, lane.cwd);
+    if (!info.exists) throw new Error(`Result file ${info.relative} does not exist.`);
+
+    if (!params.section) {
+      const files = await listTaskFiles(lane.cwd, taskId);
+      return ok(
+        [
+          `${info.relative} · ${info.bytes} bytes · ${info.lines} lines`,
+          info.headings.length ? `Sections:\n${info.headings.map((h) => `  ${h}`).join("\n")}` : "(no headings)",
+          files.length > 2 ? `Task directory: ${files.map((f) => `${f.name} (${f.bytes}B)`).join(", ")}` : "",
+          `Pass a section name to read one section.`,
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+        { lane: lane.name, task: taskId, result: info },
+      );
+    }
+
+    const body = await readSection(path, { section: params.section, maxBytes: params.max_bytes });
+    return ok(body, { lane: lane.name, section: params.section });
+  }
+
+  /**
+   * Start an agent, waiting for the pane shell to come up.
+   *
+   * A pane from `tab create` or `worktree create` is not immediately at its
+   * prompt. `agent start` then fails with agent_pane_busy or
+   * agent_pane_not_available. Measured on this machine, the shell needs about
+   * one second. Retry instead of failing the lane.
+   */
+  async function startAgent(
+    name: string,
+    kind: string,
+    paneId: string,
+    childArgs: string[],
+    signal?: AbortSignal,
+  ): Promise<any> {
+    const args = [
+      "agent", "start", name,
+      "--kind", kind,
+      "--pane", paneId,
+      "--timeout", String(START_TIMEOUT_MS),
+      ...childArgs,
+    ];
+    const transient = new Set(["agent_pane_busy", "agent_pane_not_available"]);
+    const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await herdr(exec, args, { signal, timeoutMs: START_TIMEOUT_MS + 15_000 });
+      } catch (error) {
+        const retryable = error instanceof HerdrError && transient.has(error.code);
+        if (!retryable || Date.now() >= deadline) throw error;
+        await sleep(Math.min(250 * attempt, 1_000));
+      }
+    }
+  }
+
+  /** True when the lane pane is the only pane in its tab, so closing the tab is right. */
+  async function ownsWholeTab(lane: Lane, signal?: AbortSignal): Promise<boolean> {
+    if (!lane.tabId) return false;
+    const result = await herdr(exec, ["tab", "get", lane.tabId], { signal, timeoutMs: 10_000 }).catch(() => undefined);
+    return Number(result?.tab?.pane_count ?? 0) === 1;
   }
 
   /** Live status straight from Herdr. Never cached. */
@@ -475,6 +736,12 @@ export default function (pi: ExtensionAPI) {
         }
         throw error;
       }
+    } else if (await ownsWholeTab(lane, signal)) {
+      // Close the tab when the lane is its only pane. Decide from live state, not
+      // from the stored layout, because an adopted lane has no stored layout.
+      const tabId = lane.tabId as string;
+      await herdr(exec, ["tab", "close", tabId], { signal, timeoutMs: 30_000 });
+      notes.push(`Closed tab ${tabId}.`);
     } else {
       await herdr(exec, ["pane", "close", lane.paneId], { signal, timeoutMs: 30_000 });
       notes.push(`Closed pane ${lane.paneId}.`);
@@ -494,26 +761,30 @@ export default function (pi: ExtensionAPI) {
     name: "lane",
     label: "Lane",
     description:
-      "Dispatch work to a pi subagent running in a visible Herdr pane, then read its answer from the child " +
-      "session file instead of the terminal.\n" +
+      "Dispatch work to a pi subagent running in a visible Herdr pane. The lane writes its answer to a markdown " +
+      "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
-      "  open   - split a pane (or create a git worktree) and start an agent under a lane name\n" +
-      "  ask    - send a task, wait for the lane to settle, return the final answer only\n" +
+      "  open   - create a tab (or a git worktree) and start an agent under a lane name\n" +
+      "  ask    - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
+      "  result - list the result file sections, or return one named section\n" +
       "  status - one line per lane with live Herdr state: idle, working, blocked, done\n" +
       "  trace  - the lane's tool calls and messages in order, for a lane that answered badly\n" +
       "  keys   - send logical keys such as esc or ctrl+c to a blocked lane\n" +
       "  close  - close the pane, or remove the worktree\n" +
       "A lane cannot see this conversation. Put every needed fact in the task text.",
-    promptSnippet: "Run and manage pi subagents in visible Herdr panes, and read their answers cleanly",
+    promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
       "Use lane with action open then ask when work should run in a visible pane the user can take over by typing in it.",
       "Use lane with worktree true when two or more lanes write files, because one directory tolerates one writer only.",
+      "Pass a task_id to lane action ask when one lane runs several tasks, because each task_id gets its own directory.",
       "Restate every needed fact in the lane task text, because a lane starts with an empty conversation.",
+      "Let lane action ask use its default file protocol for a long answer, then pull one section with action result.",
+      "Use lane with inline true only for a one-line answer, where a result file costs more than it saves.",
       "Trust only idle and done from lane action status; unknown does not prove that a lane finished.",
       "Use lane with action trace, not the terminal, when a lane answers badly.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["open", "ask", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "ask", "result", "status", "trace", "keys", "close"] as const, {
         description: "The lane operation to run.",
       }),
       lane: Type.Optional(
@@ -526,7 +797,38 @@ export default function (pi: ExtensionAPI) {
           description: "For ask: the full self-contained instruction. The lane cannot see this conversation.",
         }),
       ),
+      context: Type.Optional(
+        Type.String({
+          description: "For ask: extra facts for the brief file, such as file paths, constraints, or prior decisions.",
+        }),
+      ),
+      inline: Type.Optional(
+        Type.Boolean({
+          description:
+            "For ask: skip the result file and return the lane's reply directly. Use it for a one-line answer only.",
+        }),
+      ),
+      section: Type.Optional(
+        Type.String({
+          description: "For result: a heading substring. Without it the action lists the sections and returns no body.",
+        }),
+      ),
+      max_bytes: Type.Optional(
+        Type.Number({ description: "For result: maximum bytes to return. Defaults to 8000." }),
+      ),
       cwd: Type.Optional(Type.String({ description: "For open: working directory. Defaults to this session's cwd." })),
+      layout: Type.Optional(
+        StringEnum(["tab", "split"] as const, {
+          description:
+            'For open: "tab" gives the lane a full-width tab and is the default. "split" shares the caller tab.',
+        }),
+      ),
+      task_id: Type.Optional(
+        Type.String({
+          description:
+            "For ask and result: task name, which becomes the directory .pi/lanes/<task_id>/. Defaults to the lane name.",
+        }),
+      ),
       kind: Type.Optional(
         Type.String({ description: 'For open: agent kind such as pi, claude, codex, or gemini. Defaults to "pi".' }),
       ),
@@ -567,6 +869,11 @@ export default function (pi: ExtensionAPI) {
           return openLane({ ...params, lane: name }, ctx, signal, onUpdate);
         case "ask":
           return askLane({ ...params, lane: name }, ctx, signal, onUpdate);
+        case "result":
+          return resultLane(
+            { lane: name, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
+            signal,
+          );
         case "status":
           return statusLanes(ctx, signal);
         case "trace":

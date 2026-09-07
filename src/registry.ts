@@ -10,15 +10,31 @@ export type Lane = {
   name: string;
   paneId: string;
   workspaceId: string;
+  /** Set for a tab lane and a worktree lane. Closing a tab lane closes this tab. */
+  tabId?: string;
   sessionPath: string;
   cwd: string;
   kind: string;
+  /** How the lane got its terminal. It decides what close must remove. */
+  layout?: "tab" | "split" | "worktree";
   /** Set when the lane owns a Herdr git worktree. */
-  worktree?: { path: string; branch: string; workspaceId: string };
+  worktree?: {
+    path: string;
+    branch: string;
+    workspaceId: string;
+    /** Workspace holding the main checkout, so the lane groups under its repository. */
+    sourceWorkspaceId?: string;
+  };
   openedAt: string;
   closed?: boolean;
   /** True when this session found the lane through `herdr agent list`, not through open. */
   adopted?: boolean;
+  /** Current task id. It names the directory under .pi/lanes. */
+  task?: string;
+  /** Completed ask calls for the current task. It numbers the brief and result files. */
+  turns?: number;
+  /** Absolute path of the newest result file, for action "result". */
+  lastResult?: string;
 };
 
 export const LANE_ENTRY = "herdr-lane";

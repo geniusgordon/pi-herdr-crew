@@ -5,27 +5,32 @@ session file, not from the terminal.
 
 ## Why
 
-`herdr agent read` returns the raw terminal. That snapshot carries the startup
-banner, the context list, the skill list, the extension list, the model bar, and
-the token bar. The answer sits in the middle of it.
+A lane answer must not enter the parent context whole.
 
-Measured on one 4-word answer:
+`herdr agent read` returns the raw terminal, which carries the startup banner,
+the skill list, the extension list, and the token bar. Reading the child session
+file instead removes that noise, but it does not bound the size: a verbose lane
+still dumps its whole answer into the parent.
+
+The file protocol bounds it. The parent writes a brief, the lane writes a result
+file, and the lane replies with one summary line.
+
+Measured on one audit of a 6-line file, where the lane produced 15942 bytes:
 
 | Read path | Bytes the parent consumes |
 |---|---|
-| `herdr agent read` | about 2500 |
-| child session JSONL, last assistant message | about 40 |
-
-`herdr agent start` already reports the child session file as
-`.result.agent.agent_session.value`. This extension reads that file.
+| `herdr agent read` | 15942 plus terminal noise |
+| child session JSONL | 15942 |
+| file protocol | 167 plus a section list |
 
 ## Split of duty
 
 - Herdr owns the process, the pane, and the lifecycle state.
-- The child session JSONL owns the data.
+- A markdown file owns the payload.
+- The child session JSONL owns the trace and the fallback reply.
 
 The extension reads a terminal in one case only: a startup or approval dialog.
-Such a dialog exists on screen and never in the JSONL.
+Such a dialog exists on screen and never in a file.
 
 ## Install
 
@@ -49,23 +54,54 @@ One tool, six actions.
 
 | Action | What it does |
 |---|---|
-| `open` | Split a pane, or create a git worktree, then start an agent under a lane name |
-| `ask` | Send a task, wait for the lane to settle, return the final answer only |
+| `open` | Create a tab, or a git worktree, then start an agent under a lane name |
+| `ask` | Write a brief, send the task, wait, return the summary line and the result shape |
+| `result` | List the result sections, or return one named section |
 | `status` | One line per lane with live Herdr state |
 | `trace` | The lane's tool calls and messages in order |
 | `keys` | Send logical keys such as `esc` or `ctrl+c` to a blocked lane |
-| `close` | Close the pane, or remove the worktree |
+| `close` | Close the tab, or remove the worktree |
 
-### Read-only lane, same directory
+### Read-only lane
 
 ```
 lane action=open   lane=review-api
-lane action=ask    lane=review-api task="Read src/index.ts and list every unhandled error path."
+lane action=ask    lane=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
+lane action=result lane=review-api section="No timeout"
 lane action=close  lane=review-api
 ```
 
-The new pane is a sibling in the current tab. A wide pane splits right, a narrow
-pane splits down. Focus stays in the calling pane.
+`open` creates a full-width tab, because a split shrinks the caller and a narrow
+pane truncates every agent UI. Pass `layout="split"` for a sibling pane in the
+current tab. Focus stays in the calling pane either way.
+
+The tab lands in the workspace that owns the lane's repository, not in the
+caller's workspace.
+
+## The file protocol
+
+One directory per task:
+
+```
+.pi/lanes/<task_id>/brief.md       turn 1, written by the parent
+.pi/lanes/<task_id>/result.md      turn 1, written by the lane
+.pi/lanes/<task_id>/brief-2.md     turn 2
+.pi/lanes/<task_id>/result-2.md    turn 2
+.pi/lanes/<task_id>/app.ts.patch   any extra artifact the lane writes
+```
+
+`task_id` defaults to the lane name. Pass it when one lane runs several tasks.
+The extension reports every extra file in that directory, so an artifact never
+goes unnoticed.
+
+The brief fixes the contract: write the answer to the result file, reply with one
+line starting DONE or BLOCKED, and never paste the answer into the reply.
+
+Pass `inline=true` to skip the file for a one-line answer, where a file costs
+more than it saves.
+
+A lane that ignores the brief still answers. The extension falls back to its
+reply instead of losing the work.
 
 ### Writing lane, isolated worktree
 
@@ -81,6 +117,14 @@ lane action=close lane=fix-auth
 `worktree=true` runs `herdr worktree create`, which adds a real git worktree and
 opens a new workspace on it. The branch defaults to `lane/<name>`. Pass `branch`
 and `base` to override.
+
+Herdr has no parent workspace field. It groups a worktree workspace under the
+source repository instead, through `source_workspace_id` from `worktree list`.
+The extension passes that value, so the lane workspace lands beside its parent
+repository rather than at the end of the workspace list.
+
+A worktree lane runs in the worktree, so its `.pi/lanes` directory lives there
+too, not in the source checkout.
 
 `close` refuses a dirty worktree and keeps the lane open, so uncommitted work
 survives. Pass `force=true` to discard it. Herdr removes the worktree but never
@@ -104,6 +148,14 @@ trust dialog, and a worktree path is always new. The extension passes
 `--no-approve`, which ignores project-local `.pi` resources. Pass `trust=true`
 to load them with `--approve`.
 
+**A fresh tab pane is not ready at once.** `agent start` then fails with
+`agent_pane_busy`. Measured on one machine, the shell needs about one second, so
+the extension retries for up to 15 seconds.
+
+**The lane child gets `--name`, not `--session-id`.** A fresh session id makes pi
+print a warning on every lane start. The name shows in the lane footer and the
+tab title instead, and Herdr reports the session path anyway.
+
 **A blocked lane returns a pane tail, not a hang.** `ask` never answers a dialog
 by itself. It reports the dialog and stops. Answer it with `keys` after the user
 decides.
@@ -124,5 +176,6 @@ type.
 |---|---|
 | `src/index.ts` | The `lane` tool, the `/lanes` command, and the actions |
 | `src/herdr.ts` | `herdr` CLI wrapper, JSON and text variants |
+| `src/protocol.ts` | Brief and result files, task directories, section reads |
 | `src/transcript.ts` | Child session JSONL reader |
 | `src/registry.ts` | Lane bookkeeping, persisted through `pi.appendEntry` |

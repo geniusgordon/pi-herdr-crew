@@ -32,6 +32,12 @@ export function callerPane(): string {
   return pane;
 }
 
+export function callerWorkspace(): string {
+  const workspace = process.env.HERDR_WORKSPACE_ID;
+  if (!workspace) throw new HerdrError("not_in_herdr", "HERDR_WORKSPACE_ID is not set", []);
+  return workspace;
+}
+
 /** Run one herdr command and return `.result`. Throws HerdrError on failure. */
 export async function herdr(
   exec: Exec,
