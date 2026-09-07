@@ -229,6 +229,12 @@ export default function (pi: ExtensionAPI) {
       base?: string;
       trust?: boolean;
       layout?: "tab" | "split";
+      task?: string;
+      task_id?: string;
+      context?: string;
+      inline?: boolean;
+      wait?: boolean;
+      timeout_ms?: number;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -369,6 +375,34 @@ export default function (pi: ExtensionAPI) {
       lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
       if (worktree.sourceWorkspaceId) lines.push(`  under   ${worktree.sourceWorkspaceId}`);
     }
+
+    // A task on open sends the first prompt in the same call. Open then ask is
+    // two round trips for one intent, and the member is idle between them.
+    const task = params.task?.trim();
+    if (task) {
+      onUpdate?.(ok(lines.join("\n")));
+      const answer = await askMember(
+        {
+          member: name,
+          task,
+          task_id: params.task_id,
+          context: params.context,
+          inline: params.inline,
+          wait: params.wait,
+          timeout_ms: params.timeout_ms,
+        },
+        ctx,
+        signal,
+        onUpdate,
+      );
+      return {
+        content: [{ type: "text", text: [...lines, "", answer.content.map((c) => c.text).join("\n")].join("\n") }],
+        // Keep the ask details on top. A caller reads blocked and pending from
+        // them, and the open summary is already in the text.
+        details: { opened: member, ...(answer.details as Record<string, unknown> | undefined) },
+      };
+    }
+
     lines.push(`Next: call crew with action "ask".`);
 
     return ok(lines.join("\n"), { member });
@@ -939,7 +973,7 @@ export default function (pi: ExtensionAPI) {
       "Dispatch work to a pi subagent running in a visible Herdr pane. The member writes its answer to a markdown " +
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
-      "  open   - create a tab (or a git worktree) and start an agent under a member name\n" +
+      "  open   - create a tab (or a git worktree) and start an agent under a member name; pass task to send the first task too\n" +
       "  ask     - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
       "  collect - wait for a task sent with wait false, or resume a wait that ran out of budget\n" +
       "  result  - list the result file sections, or return one named section\n" +
@@ -950,7 +984,9 @@ export default function (pi: ExtensionAPI) {
       "A member cannot see this conversation. Put every needed fact in the task text.",
     promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
-      "Use crew with action open then ask when work should run in a visible pane the user can take over by typing in it.",
+      "Use crew with action open when work should run in a visible pane the user can take over by typing in it.",
+      "Pass task to crew action open for a member's first task, because open then ask costs two calls for one intent.",
+      "Use crew action ask only for a second or later task on an open member.",
       "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
       "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
       "Restate every needed fact in the crew task text, because a member starts with an empty conversation.",
@@ -972,18 +1008,22 @@ export default function (pi: ExtensionAPI) {
       ),
       task: Type.Optional(
         Type.String({
-          description: "For ask: the full self-contained instruction. The member cannot see this conversation.",
+          description:
+            "For ask, and for open: the full self-contained instruction. The member cannot see this conversation. " +
+            "On open it runs as the member's first task, so no separate ask call is needed.",
         }),
       ),
       context: Type.Optional(
         Type.String({
-          description: "For ask: extra facts for the brief file, such as file paths, constraints, or prior decisions.",
+          description:
+            "For ask and open with task: extra facts for the brief file, such as file paths, constraints, or prior decisions.",
         }),
       ),
       inline: Type.Optional(
         Type.Boolean({
           description:
-            "For ask: skip the result file and return the member's reply directly. Use it for a one-line answer only.",
+            "For ask and open with task: skip the result file and return the member's reply directly. " +
+            "Use it for a one-line answer only.",
         }),
       ),
       section: Type.Optional(
@@ -1004,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
       task_id: Type.Optional(
         Type.String({
           description:
-            "For ask and result: task name, which becomes the directory .pi/crew/<task_id>/ in this session's cwd. " +
+            "For ask, result, and open with task: task name, which becomes the directory .pi/crew/<task_id>/ in this session's cwd. " +
             "Defaults to the member name. Action result accepts it without a member, because a task outlives its member.",
         }),
       ),
@@ -1029,12 +1069,15 @@ export default function (pi: ExtensionAPI) {
       ),
       lines: Type.Optional(Type.Number({ description: "For trace: maximum lines to return. Defaults to 40." })),
       timeout_ms: Type.Optional(
-        Type.Number({ description: "For ask and collect: wait budget in milliseconds. Defaults to 600000." }),
+        Type.Number({
+          description: "For ask, collect, and open with task: wait budget in milliseconds. Defaults to 600000.",
+        }),
       ),
       wait: Type.Optional(
         Type.Boolean({
           description:
-            "For ask: false returns as soon as the task is sent. Start every parallel member first, then collect each one.",
+            "For ask, and for open with task: false returns as soon as the task is sent. " +
+            "Start every parallel member first, then collect each one.",
         }),
       ),
       force: Type.Optional(Type.Boolean({ description: "For close: discard uncommitted work in a worktree member." })),

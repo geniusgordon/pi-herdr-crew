@@ -32,9 +32,37 @@ Measured on one audit of this repository, where the member produced 12283 bytes:
 The extension reads a terminal in one case only: a startup or approval dialog.
 Such a dialog exists on screen and never in a file.
 
-## Install
+## Prerequisites
 
-Requires pi inside a Herdr pane, so `HERDR_ENV=1`.
+Two things, both required.
+
+1. Run pi inside a Herdr pane, so `HERDR_ENV=1`.
+2. Install the Herdr pi integration once per machine:
+
+```bash
+herdr integration install pi
+herdr integration status | head -1   # expect: pi: current
+```
+
+That command writes `~/.pi/agent/extensions/herdr-agent-state.ts`. The extension
+reports two facts to Herdr over the pane socket:
+
+| Report | Value |
+|---|---|
+| `pane.report_agent_session` | the absolute path of the pane's session JSONL |
+| `pane.report_agent` | the agent state: `working`, `blocked`, or `idle` |
+
+The crew tool needs both:
+
+- `open` reads the session path from `herdr agent start`. Without the integration
+  it reports no session file, and `open` fails.
+- `ask`, `collect`, `result`, and `trace` read that session file.
+- `status` and the blocked-dialog check read the agent state.
+
+Rerun the install command when `herdr integration status` reports `outdated`. A
+Herdr upgrade can raise the integration version.
+
+## Install
 
 ```bash
 pi install git:github.com/geniusgordon/pi-herdr-crew
@@ -70,7 +98,7 @@ One tool, eight actions.
 
 | Action | What it does |
 |---|---|
-| `open` | Create a tab, or a git worktree, then start an agent under a member name |
+| `open` | Create a tab, or a git worktree, start an agent, and send a first `task` |
 | `ask` | Write a brief, send the task, wait, return the summary line and the result shape |
 | `collect` | Wait for a task sent with `wait=false`, or resume a wait that ran out of budget |
 | `result` | List the result sections, or return one named section |
@@ -82,11 +110,18 @@ One tool, eight actions.
 ### Read-only member
 
 ```
-crew action=open   member=review-api
-crew action=ask    member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
+crew action=open   member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
 crew action=result member=review-api section="No timeout"
 crew action=close  member=review-api
 ```
+
+`open` accepts every `ask` field: `task`, `task_id`, `context`, `inline`, `wait`,
+and `timeout_ms`. A `task` on `open` runs as the member's first task, so one call
+replaces `open` then `ask`. Use `ask` for a second or later task on that member.
+
+Startup costs a few seconds before the task starts. `wait=false` returns as soon
+as the task is sent, and a wait that runs out of budget keeps the task in flight
+for a later `collect`, so neither path loses the answer.
 
 `open` creates a full-width tab, because a split shrinks the caller and a narrow
 pane truncates every agent UI. Pass `layout="split"` for a sibling pane in the
@@ -144,8 +179,7 @@ One directory tolerates one writer. Two writers in one directory destroy each
 other's edits. Give each writing member its own worktree:
 
 ```
-crew action=open  member=fix-auth worktree=true
-crew action=ask   member=fix-auth task="..."
+crew action=open  member=fix-auth worktree=true task="..."
 crew action=close member=fix-auth
 ```
 
@@ -190,8 +224,8 @@ member keeps working. So `ask` sends the prompt, then waits separately. Pass
 `wait=false` to return at once, then `collect` each member:
 
 ```
-crew action=ask member=a task="..." wait=false
-crew action=ask member=b task="..." wait=false
+crew action=open member=a task="..." wait=false
+crew action=open member=b task="..." wait=false
 crew action=status
 crew action=collect member=a
 crew action=collect member=b
