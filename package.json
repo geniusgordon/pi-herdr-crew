@@ -1,0 +1,12 @@
+{
+  "name": "pi-herdr-lane",
+  "version": "0.1.0",
+  "description": "Dispatch and manage pi subagents as Herdr panes. Reads results from session JSONL, not from the terminal.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": ["src", "README.md"],
+  "keywords": ["pi", "pi-extension", "herdr", "subagent", "orchestrator"]
+}
