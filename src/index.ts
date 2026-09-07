@@ -875,6 +875,22 @@ export default function (pi: ExtensionAPI) {
     const member = await resolveMember(params.member, signal);
     const notes: string[] = [];
 
+    // A member whose pane already died needs bookkeeping only. Closing its pane
+    // fails, and that failure would leave the member open forever.
+    if ((await memberState(member)) === "gone" && !member.worktree) {
+      registry.markClosed(member.name);
+      pi.appendEntry(CREW_ENTRY, { ...member, closed: true, pending: undefined });
+      refreshStatus(ctx);
+      return ok(
+        [
+          `Member ${member.name} is closed. Its pane was already gone.`,
+          member.sessionPath ? `Transcript stays readable at ${member.sessionPath}.` : "",
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+      );
+    }
+
     if (member.worktree) {
       const args = ["worktree", "remove", "--workspace", member.worktree.workspaceId];
       if (params.force) args.push("--force");
