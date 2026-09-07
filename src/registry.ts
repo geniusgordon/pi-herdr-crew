@@ -29,15 +29,34 @@ export type Member = {
   closed?: boolean;
   /** True when this session found the member through `herdr agent list`, not through open. */
   adopted?: boolean;
-  /** Current task id. It names the directory under .pi/members. */
+  /** Current task id. It names the directory under .pi/crew. */
   task?: string;
   /** Completed ask calls for the current task. It numbers the brief and result files. */
   turns?: number;
   /** Absolute path of the newest result file, for action "result". */
   lastResult?: string;
+  /** A task that was sent and not collected yet. */
+  pending?: Pending;
 };
 
-export const CREW_ENTRY = "herdr-member";
+/**
+ * A task in flight.
+ *
+ * It lets ask return at once and lets collect resume the wait. Without it a
+ * single blocking call can exceed the parent tool-call budget, and the answer is
+ * lost while the member keeps working.
+ */
+export type Pending = {
+  taskId: string;
+  turn: number;
+  /** Transcript turn count before the task was sent, so collect finds the new turn. */
+  baseline: number;
+  /** Absolute result path, or undefined for an inline task. */
+  result?: string;
+  sentAt: number;
+};
+
+export const CREW_ENTRY = "herdr-crew";
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 

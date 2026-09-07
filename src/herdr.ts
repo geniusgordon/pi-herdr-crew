@@ -68,6 +68,15 @@ export async function herdr(
   if (payload?.error) {
     throw new HerdrError(String(payload.error.code ?? "herdr_error"), String(payload.error.message ?? "herdr failed"), args);
   }
+  // A killed process reports code 0 with empty output, so check killed first.
+  // Without this the caller sees "herdr returned no result:" and no cause.
+  if (res.killed) {
+    throw new HerdrError(
+      "timeout",
+      `herdr ${args.slice(0, 2).join(" ")} exceeded ${options.timeoutMs ?? 180_000} ms and was killed`,
+      args,
+    );
+  }
   if (res.code !== 0) {
     const detail = (res.stderr || res.stdout || "").trim().slice(0, 400);
     throw new HerdrError(res.code === 2 ? "cli_usage" : "herdr_failed", detail || `herdr exited ${res.code}`, args);
@@ -95,6 +104,13 @@ export async function herdrText(
 
   const res = await exec("herdr", args, { signal: options.signal, timeout: options.timeoutMs ?? 30_000 });
 
+  if (res.killed) {
+    throw new HerdrError(
+      "timeout",
+      `herdr ${args.slice(0, 2).join(" ")} exceeded ${options.timeoutMs ?? 30_000} ms and was killed`,
+      args,
+    );
+  }
   if (res.code !== 0) {
     let code = res.code === 2 ? "cli_usage" : "herdr_failed";
     let message = (res.stderr || res.stdout || "").trim().slice(0, 400);

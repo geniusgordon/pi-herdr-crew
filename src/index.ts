@@ -43,7 +43,7 @@ import {
   writeBrief,
   type ResultInfo,
 } from "./protocol.js";
-import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member } from "./registry.js";
+import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const DEFAULT_ASK_TIMEOUT_MS = 600_000;
@@ -396,6 +396,7 @@ export default function (pi: ExtensionAPI) {
       timeout_ms?: number;
       inline?: boolean;
       context?: string;
+      wait?: boolean;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -423,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 
     const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
+    const wait = params.wait !== false;
 
     // The file protocol is the default. It keeps a large answer out of this
     // context: the member writes markdown to disk and replies with one line.
@@ -453,13 +455,14 @@ export default function (pi: ExtensionAPI) {
       onUpdate?.(ok(`${member.name} is working...`));
     }
 
-    persist({ ...member, task: taskId, turns: turn, lastResult: useFile ? paths.result : undefined });
+    const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
+    persist({ ...member, task: taskId, turns: turn, lastResult: pending.result, pending });
 
+    // Send without --wait, then wait separately. A single blocking call cannot
+    // outlive the parent tool-call budget, and a killed call loses the answer
+    // while the member keeps working.
     try {
-      await herdr(exec, ["agent", "prompt", member.name, prompt, "--wait", "--timeout", String(timeout)], {
-        signal,
-        timeoutMs: timeout + 30_000,
-      });
+      await herdr(exec, ["agent", "prompt", member.name, prompt], { signal, timeoutMs: 30_000 });
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
         const tail = await tailPane(member.paneId, 30);
@@ -477,7 +480,68 @@ export default function (pi: ExtensionAPI) {
       throw error;
     }
 
-    const transcript = await awaitNewTurn(member.sessionPath, baseline);
+    if (!wait) {
+      return ok(
+        [
+          `Member ${member.name} started task ${taskId}.`,
+          useFile ? `It writes ${paths.resultRelative}.` : `It answers inline.`,
+          `This call did not wait. Collect the answer with action "collect".`,
+        ].join("\n"),
+        { member: member.name, task: taskId, pending: true },
+      );
+    }
+
+    return collectMember({ member: member.name, timeout_ms: timeout }, ctx, signal, onUpdate);
+  }
+
+  /**
+   * Wait for a member's current task, then return its summary and result shape.
+   *
+   * This is the second half of ask. Keeping it separate lets ask return at once
+   * with wait false, and lets a caller retry a wait that ran out of budget
+   * without sending the task again.
+   */
+  async function collectMember(
+    params: { member: string; timeout_ms?: number },
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+    onUpdate?: (result: ToolResult) => void,
+  ): Promise<ToolResult> {
+    const member = await resolveMember(params.member, signal);
+    const pending = member.pending;
+    if (!pending) {
+      throw new Error(`Member ${member.name} has no task in flight. Use action "ask" first.`);
+    }
+
+    const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
+    const taskId = pending.taskId;
+    const paths = taskPaths(member.cwd, taskId, pending.turn);
+    const useFile = pending.result !== undefined;
+
+    onUpdate?.(ok(`Waiting for ${member.name} on task ${taskId}...`));
+
+    try {
+      await herdr(exec, ["agent", "wait", member.name, "--timeout", String(timeout)], {
+        signal,
+        timeoutMs: timeout + 30_000,
+      });
+    } catch (error) {
+      // A wait that ran out of budget is not a failure of the member. Report the
+      // live state and keep the task in flight so a later collect still works.
+      if (error instanceof HerdrError && error.code === "timeout") {
+        return ok(
+          [
+            `Waiting for ${member.name} exceeded this call's budget. The member keeps working.`,
+            `State: ${await memberState(member)}. Elapsed: ${Math.round((Date.now() - pending.sentAt) / 1000)}s.`,
+            `Call action "collect" again, or action "status" to check on it.`,
+          ].join("\n"),
+          { member: member.name, pending: true },
+        );
+      }
+      throw error;
+    }
+
+    const transcript = await awaitNewTurn(member.sessionPath, pending.baseline);
     const state = await memberState(member);
     const meta = [
       `member=${member.name}`,
@@ -489,6 +553,9 @@ export default function (pi: ExtensionAPI) {
       .filter(Boolean)
       .join(" · ");
 
+    // The task settled, so it is no longer in flight. Clear it before returning,
+    // or a later collect waits on work that already finished.
+    persist({ ...member, pending: undefined });
     refreshStatus(ctx);
 
     if (useFile) {
@@ -678,9 +745,11 @@ export default function (pi: ExtensionAPI) {
           ? " <- needs input"
           : state === "gone"
             ? " <- pane lost"
-            : member.adopted
-              ? " <- adopted"
-              : "";
+            : member.pending
+              ? ` <- task ${member.pending.taskId} in flight, ${Math.round((Date.now() - member.pending.sentAt) / 1000)}s`
+              : member.adopted
+                ? " <- adopted"
+                : "";
       return `${member.name.padEnd(16)} ${state.padEnd(8)} ${member.paneId.padEnd(8)} ${member.worktree?.branch ?? member.cwd}${flag}`;
     });
 
@@ -766,8 +835,9 @@ export default function (pi: ExtensionAPI) {
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
       "  open   - create a tab (or a git worktree) and start an agent under a member name\n" +
-      "  ask    - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
-      "  result - list the result file sections, or return one named section\n" +
+      "  ask     - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
+      "  collect - wait for a task sent with wait false, or resume a wait that ran out of budget\n" +
+      "  result  - list the result file sections, or return one named section\n" +
       "  status - one line per member with live Herdr state: idle, working, blocked, done\n" +
       "  trace  - the member's tool calls and messages in order, for a member that answered badly\n" +
       "  keys   - send logical keys such as esc or ctrl+c to a blocked member\n" +
@@ -780,12 +850,14 @@ export default function (pi: ExtensionAPI) {
       "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
       "Restate every needed fact in the crew task text, because a member starts with an empty conversation.",
       "Let crew action ask use its default file protocol for a long answer, then pull one section with action result.",
+      "Send crew action ask with wait false to every member first, then call action collect for each, to run members in parallel.",
+      "Call crew action collect again when a wait reports that it ran out of budget, because the member keeps working.",
       "Use crew with inline true only for a one-line answer, where a result file costs more than it saves.",
       "Trust only idle and done from crew action status; unknown does not prove that a member finished.",
       "Use crew with action trace, not the terminal, when a member answers badly.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["open", "ask", "result", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
         description: "The member operation to run.",
       }),
       member: Type.Optional(
@@ -850,7 +922,15 @@ export default function (pi: ExtensionAPI) {
         Type.Array(Type.String(), { description: 'For keys: logical keys in order, for example ["esc"] or ["ctrl+c"].' }),
       ),
       lines: Type.Optional(Type.Number({ description: "For trace: maximum lines to return. Defaults to 40." })),
-      timeout_ms: Type.Optional(Type.Number({ description: "For ask: wait budget in milliseconds. Defaults to 600000." })),
+      timeout_ms: Type.Optional(
+        Type.Number({ description: "For ask and collect: wait budget in milliseconds. Defaults to 600000." }),
+      ),
+      wait: Type.Optional(
+        Type.Boolean({
+          description:
+            "For ask: false returns as soon as the task is sent. Start every parallel member first, then collect each one.",
+        }),
+      ),
       force: Type.Optional(Type.Boolean({ description: "For close: discard uncommitted work in a worktree member." })),
     }),
 
@@ -870,6 +950,8 @@ export default function (pi: ExtensionAPI) {
           return openMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "ask":
           return askMember({ ...params, member: name }, ctx, signal, onUpdate);
+        case "collect":
+          return collectMember({ member: name, timeout_ms: params.timeout_ms }, ctx, signal, onUpdate);
         case "result":
           return readResult(
             { member: name, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },
