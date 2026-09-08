@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Dispatch and manage pi subagents as a Herdr crew. Each member answers through a markdown file, not the terminal.",
   "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "license": "MIT",
   "author": "Gordon <geniusgordon@gmail.com>",
   "repository": {
@@ -15,6 +19,16 @@
     "extensions": [
       "./src/index.ts"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "typebox": "1.3.7"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
   },
   "files": [
     "LICENSE",
