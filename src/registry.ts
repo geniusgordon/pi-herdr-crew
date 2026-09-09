@@ -54,6 +54,8 @@ export type Pending = {
   /** Absolute result path, or undefined for an inline task. */
   result?: string;
   sentAt: number;
+  /** The latest state sent to the parent. This suppresses duplicate notifications. */
+  notifiedState?: "done" | "blocked" | "gone";
 };
 
 export const CREW_ENTRY = "herdr-crew";

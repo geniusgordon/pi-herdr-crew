@@ -22,7 +22,15 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { classifyTaskResult, planCleanup, settleCleanup, type CleanupPolicy } from "./lifecycle.js";
+import {
+  assertCanDispatch,
+  isLiveObservation,
+  isSamePending,
+  notificationState,
+  releaseWatcher,
+  rollbackDispatch,
+  shouldCheckState,
+} from "./async-lifecycle.js";
 import {
   HerdrError,
   callerPane,
@@ -50,7 +58,6 @@ import {
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
-const DEFAULT_ASK_TIMEOUT_MS = 600_000;
 const START_TIMEOUT_MS = 60_000;
 const SHELL_READY_TIMEOUT_MS = 15_000;
 
@@ -78,6 +85,7 @@ function sleep(ms: number): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
   const registry = new MemberRegistry();
+  const watchers = new Map<string, AbortController>();
   const exec: Exec = (command, args, options) => pi.exec(command, args, options);
 
   // ---------------------------------------------------------------- lifecycle
@@ -89,6 +97,14 @@ export default function (pi: ExtensionAPI) {
     }
     registry.restore(ctx.sessionManager.getEntries());
     refreshStatus(ctx);
+    for (const member of registry.openMembers()) {
+      if (member.pending) watchPending(member.name);
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    for (const controller of watchers.values()) controller.abort();
+    watchers.clear();
   });
 
   function refreshStatus(ctx: ExtensionContext): void {
@@ -234,8 +250,6 @@ export default function (pi: ExtensionAPI) {
       task_id?: string;
       context?: string;
       inline?: boolean;
-      wait?: boolean;
-      timeout_ms?: number;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -389,8 +403,6 @@ export default function (pi: ExtensionAPI) {
           task_id: params.task_id,
           context: params.context,
           inline: params.inline,
-          wait: params.wait,
-          timeout_ms: params.timeout_ms,
         },
         ctx,
         signal,
@@ -415,16 +427,15 @@ export default function (pi: ExtensionAPI) {
       member: string;
       task?: string;
       task_id?: string;
-      timeout_ms?: number;
       inline?: boolean;
       context?: string;
-      wait?: boolean;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
     const member = await resolveMember(params.member, signal);
+    assertCanDispatch(member);
     const task = params.task?.trim();
     if (!task) throw new Error(`Action "ask" needs a task. Pass the full instruction; the member cannot see this session.`);
     // An empty session path means the child never reached its prompt. A startup
@@ -445,8 +456,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
-    const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
-    const wait = params.wait !== false;
 
     // The file protocol is the default. It keeps a large answer out of this
     // context: the member writes markdown to disk and replies with one line.
@@ -486,13 +495,12 @@ export default function (pi: ExtensionAPI) {
     const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
     persist({ ...member, task: taskId, turns: turn, lastResult: pending.result, pending });
 
-    // Send without --wait, then wait separately. A single blocking call cannot
-    // outlive the parent tool-call budget, and a killed call loses the answer
-    // while the member keeps working.
+    // Dispatch once. The session-scoped supervisor watches completion after this call returns.
     try {
       await herdr(exec, ["agent", "prompt", member.name, prompt], { signal, timeoutMs: 30_000 });
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
+        persist(rollbackDispatch(member, pending));
         const tail = await tailPane(member.paneId, 30);
         return ok(
           [
@@ -505,35 +513,26 @@ export default function (pi: ExtensionAPI) {
           { blocked: true, member: member.name },
         );
       }
+      watchPending(member.name);
       throw error;
     }
 
-    if (!wait) {
-      return ok(
-        [
-          `Member ${member.name} started task ${taskId}.`,
-          useFile ? `It writes ${paths.resultRelative}.` : `It answers inline.`,
-          `This call did not wait. Collect the answer with action "collect".`,
-        ].join("\n"),
-        { member: member.name, task: taskId, pending: true },
-      );
-    }
-
-    return collectMember({ member: member.name, timeout_ms: timeout }, ctx, signal, onUpdate);
+    watchPending(member.name);
+    return ok(
+      [
+        `Member ${member.name} started task ${taskId}.`,
+        useFile ? `It writes ${paths.resultRelative}.` : `It answers inline.`,
+        `The main agent receives a notification when the task settles.`,
+      ].join("\n"),
+      { member: member.name, task: taskId, pending: true },
+    );
   }
 
-  /**
-   * Wait for a member's current task, then return its summary and result shape.
-   *
-   * This is the second half of ask. Keeping it separate lets ask return at once
-   * with wait false, and lets a caller retry a wait that ran out of budget
-   * without sending the task again.
-   */
+  /** Return a settled member result without waiting. */
   async function collectMember(
-    params: { member: string; timeout_ms?: number },
+    params: { member: string },
     ctx: ExtensionContext,
     signal?: AbortSignal,
-    onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
     const member = await resolveMember(params.member, signal);
     const pending = member.pending;
@@ -541,21 +540,13 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`Member ${member.name} has no task in flight. Use action "ask" first.`);
     }
 
-    const timeout = params.timeout_ms ?? DEFAULT_ASK_TIMEOUT_MS;
     const taskId = pending.taskId;
     const paths = taskPaths(ctx.cwd, taskId, pending.turn);
     const useFile = pending.result !== undefined;
-
-    onUpdate?.(ok(`Waiting for ${member.name} on task ${taskId}...`));
-
-    // Wait on the transcript, not on the Herdr lifecycle. `agent prompt` returns
-    // before the child leaves its settled state, so a lifecycle wait can observe
-    // the old state and return at once. A completed turn appends a turn summary
-    // to the child session file, which is an unambiguous signal.
-    const outcome = await waitForTurn(member, pending.baseline, timeout, signal, onUpdate);
+    const outcome = await inspectTurn(member, pending.baseline);
 
     // A lost pane is not a slow member, so say so. The task cannot finish.
-    if (outcome.kind === "timeout" && outcome.state === "gone") {
+    if (outcome.kind === "pending" && outcome.state === "gone") {
       return ok(
         [
           `Member ${member.name} has no live pane, so task ${taskId} cannot finish.`,
@@ -569,12 +560,12 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    if (outcome.kind === "timeout") {
+    if (outcome.kind === "pending") {
       return ok(
         [
-          `Waiting for ${member.name} exceeded this call's budget. The member keeps working.`,
+          `Member ${member.name} is still working on task ${taskId}.`,
           `State: ${outcome.state}. Elapsed: ${Math.round((Date.now() - pending.sentAt) / 1000)}s.`,
-          `Call action "collect" again, or action "status" to check on it.`,
+          `Wait for the completion notification before action "collect".`,
         ].join("\n"),
         { member: member.name, pending: true },
       );
@@ -659,70 +650,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     return ok(`${transcript.final}\n\n--- ${meta}`, { member: member.name, state, final: transcript.final });
-  }
-
-  /** Run one task and close its member only after a durable, settled result. */
-  async function runMember(
-    params: {
-      member: string;
-      task?: string;
-      cleanup?: CleanupPolicy;
-      cwd?: string;
-      kind?: string;
-      worktree?: boolean;
-      branch?: string;
-      base?: string;
-      trust?: boolean;
-      layout?: "tab" | "split";
-      task_id?: string;
-      context?: string;
-      inline?: boolean;
-      wait?: boolean;
-      timeout_ms?: number;
-    },
-    ctx: ExtensionContext,
-    signal?: AbortSignal,
-    onUpdate?: (result: ToolResult) => void,
-  ): Promise<ToolResult> {
-    if (params.wait === false && (params.cleanup ?? "after-result") === "after-result") {
-      throw new Error(`Action "run" with cleanup "after-result" must wait. Remove wait=false or use cleanup "keep".`);
-    }
-
-    const task = params.task?.trim();
-    if (!task) throw new Error(`Action "run" needs a task. Pass the full instruction; the member cannot see this session.`);
-
-    const taskResult = await openMember({ ...params, task, wait: params.wait }, ctx, signal, onUpdate);
-    const details = (taskResult.details ?? {}) as Record<string, unknown>;
-    const decision = classifyTaskResult(details, params.inline === true);
-    const plan = planCleanup(params.cleanup ?? "after-result", decision);
-
-    const cleanup = plan.kind === "keep"
-      ? await settleCleanup({
-          member: params.member,
-          policy: "keep",
-          durable: decision.durable,
-          getState: async () => "unknown",
-          close: async () => ({ text: "" }),
-        })
-      : plan.kind === "defer"
-        ? {
-            state: "deferred" as const,
-            message: `Panel: kept open for member ${params.member} because the task needs more work or inspection.`,
-          }
-        : await settleCleanup({
-            member: params.member,
-            policy: "after-result",
-            durable: plan.durable,
-            getState: async () => memberState(await resolveMember(params.member, signal)),
-            close: async () => {
-              const result = await closeMember({ member: params.member }, ctx, signal);
-              const closeDetails = (result.details ?? {}) as { dirty?: boolean };
-              return { text: result.content.map((item) => item.text).join("\n"), dirty: closeDetails.dirty };
-            },
-          });
-
-    const text = taskResult.content.map((item) => item.text).join("\n");
-    return ok(`${text}\n\n${cleanup.message}`, { ...details, cleanup: cleanup.state });
   }
 
   /**
@@ -824,46 +751,85 @@ export default function (pi: ExtensionAPI) {
   type Outcome =
     | { kind: "done"; transcript: Transcript }
     | { kind: "blocked" }
-    | { kind: "timeout"; state: string };
+    | { kind: "pending"; state: string };
 
-  /**
-   * Wait for the member to finish one turn.
-   *
-   * The child session file is the settle signal, because a completed turn
-   * appends a turn summary to it. Reading that file is a local read, so poll it
-   * often. Ask Herdr for the lifecycle state rarely, only to catch a dialog.
-   */
-  async function waitForTurn(
-    member: Member,
-    baseline: number,
-    timeoutMs: number,
-    signal?: AbortSignal,
-    onUpdate?: (result: ToolResult) => void,
-  ): Promise<Outcome> {
+  /** Inspect one child turn without making the caller wait. */
+  async function inspectTurn(member: Member, baseline: number, checkState = true): Promise<Outcome> {
     const empty: Transcript = { turns: [], toolNames: [], turnCount: 0 };
-    const deadline = Date.now() + timeoutMs;
-    let lastState = "unknown";
+    const transcript = await readTranscript(member.sessionPath).catch(() => empty);
+    if (transcript.turnCount > baseline) return { kind: "done", transcript };
+    if (!checkState) return { kind: "pending", state: "unknown" };
 
-    for (let tick = 0; Date.now() < deadline; tick += 1) {
-      if (signal?.aborted) return { kind: "timeout", state: lastState };
+    const state = await memberState(member);
+    if (state === "blocked") return { kind: "blocked" };
+    return { kind: "pending", state };
+  }
 
-      const transcript = await readTranscript(member.sessionPath).catch(() => empty);
-      if (transcript.turnCount > baseline) return { kind: "done", transcript };
+  /** Start one session-scoped watcher for a detached member task. */
+  function watchPending(memberName: string): void {
+    if (watchers.has(memberName)) return;
 
-      // Check Herdr every fifth tick. A dialog stops the turn forever otherwise.
-      if (tick % 5 === 0) {
-        lastState = await memberState(member);
-        if (lastState === "blocked") return { kind: "blocked" };
-        if (lastState === "gone") return { kind: "timeout", state: lastState };
-        if (tick > 0 && tick % 30 === 0) {
-          onUpdate?.(ok(`${member.name} still working, ${Math.round((timeoutMs - (deadline - Date.now())) / 1000)}s elapsed...`));
+    const controller = new AbortController();
+    watchers.set(memberName, controller);
+    void supervisePending(memberName, controller.signal)
+      .catch((error) => console.error(`Crew watcher failed for ${memberName}:`, error))
+      .finally(() => releaseWatcher(watchers, memberName, controller));
+  }
+
+  /** Notify the parent once when a detached task finishes or needs attention. */
+  async function supervisePending(memberName: string, signal: AbortSignal): Promise<void> {
+    let tick = 0;
+    while (!signal.aborted) {
+      const member = registry.get(memberName);
+      const pending = member.pending;
+      if (!pending) return;
+
+      const outcome = await inspectTurn(member, pending.baseline, shouldCheckState(pending, tick));
+      if (signal.aborted) return;
+      const state = notificationState(outcome);
+
+      if (state) {
+        if (pending.notifiedState !== state) {
+          const current = registry.get(memberName);
+          if (!isSamePending(current.pending, pending)) return;
+
+          const action = state === "done"
+            ? `Call crew with action "collect" and member "${member.name}".`
+            : state === "blocked"
+              ? `Inspect member "${member.name}", answer its dialog with action "keys", then wait for the next notification.`
+              : `Call crew with action "collect" and member "${member.name}" to inspect the lost task.`;
+          try {
+            pi.sendMessage(
+              {
+                customType: "herdr-crew-event",
+                content: `Crew task ${pending.taskId} is ${state}. ${action}`,
+                display: true,
+                details: { member: member.name, taskId: pending.taskId, turn: pending.turn, state },
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          } catch (error) {
+            console.error(`Crew notification failed for ${memberName}:`, error);
+            await sleep(1_000);
+            continue;
+          }
+
+          const delivered = registry.get(memberName);
+          if (!isSamePending(delivered.pending, pending)) return;
+          const updatedPending: Pending = { ...delivered.pending, notifiedState: state };
+          persist({ ...delivered, pending: updatedPending });
         }
+        if (state !== "blocked") return;
+      } else if (pending.notifiedState === "blocked" && isLiveObservation(outcome)) {
+        const current = registry.get(memberName);
+        if (!isSamePending(current.pending, pending)) return;
+        const updatedPending: Pending = { ...current.pending, notifiedState: undefined };
+        persist({ ...current, pending: updatedPending });
       }
 
+      tick += 1;
       await sleep(1_000);
     }
-
-    return { kind: "timeout", state: lastState };
   }
 
   /** True when the member pane is the only pane in its tab, so closing the tab is right. */
@@ -963,6 +929,10 @@ export default function (pi: ExtensionAPI) {
     if (!keys.length) throw new Error(`Action "keys" needs at least one logical key, for example ["esc"] or ["ctrl+c"].`);
 
     await herdr(exec, ["agent", "send-keys", member.name, ...keys], { signal, timeoutMs: 15_000 });
+    const current = registry.get(member.name);
+    if (current.pending?.notifiedState === "blocked") {
+      persist({ ...current, pending: { ...current.pending, notifiedState: undefined } });
+    }
     await sleep(400);
     return ok([`Sent ${keys.join(" ")} to ${member.name}. State: ${await memberState(member)}.`, "", await tailPane(member.paneId, 20)].join("\n"));
   }
@@ -979,6 +949,8 @@ export default function (pi: ExtensionAPI) {
     // fails, and that failure would leave the member open forever.
     if ((await memberState(member)) === "gone" && !member.worktree) {
       registry.markClosed(member.name);
+      watchers.get(member.name)?.abort();
+      watchers.delete(member.name);
       pi.appendEntry(CREW_ENTRY, { ...member, closed: true, pending: undefined });
       refreshStatus(ctx);
       return ok(
@@ -1023,6 +995,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     registry.markClosed(member.name);
+    watchers.get(member.name)?.abort();
+    watchers.delete(member.name);
     pi.appendEntry(CREW_ENTRY, { ...member, closed: true });
     refreshStatus(ctx);
 
@@ -1039,10 +1013,9 @@ export default function (pi: ExtensionAPI) {
       "Dispatch work to a pi subagent running in a visible Herdr pane. The member writes its answer to a markdown " +
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
-      "  run    - open a member, run one task, and close it after a durable result; use cleanup keep to retain it\n" +
-      "  open   - create a tab (or a git worktree) and start an agent under a member name; pass task to send the first task too\n" +
-      "  ask     - write a brief file, send the task, wait, return the summary line and the result file shape\n" +
-      "  collect - wait for a task sent with wait false, or resume a wait that ran out of budget\n" +
+      "  open   - create a tab or worktree, start an agent, and dispatch an optional first task\n" +
+      "  ask     - write a brief and dispatch a task to an open member\n" +
+      "  collect - return a settled task summary and result shape without waiting\n" +
       "  result  - list the result file sections, or return one named section\n" +
       "  status - one line per member with live Herdr state: idle, working, blocked, done\n" +
       "  trace  - the member's tool calls and messages in order, for a member that answered badly\n" +
@@ -1051,23 +1024,20 @@ export default function (pi: ExtensionAPI) {
       "A member cannot see this conversation. Put every needed fact in the task text.",
     promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
-      "Use crew with action run for one task. It closes the member after it stores a durable result.",
-      "Use crew with action open when the user can take over the pane or the member will receive more tasks.",
-      "Pass task to crew action open for a member's first task, because open then ask costs two calls for one intent.",
+      "Use crew with action open to create a member and dispatch its first task.",
       "Use crew action ask only for a second or later task on an open member.",
+      "Crew open and ask return after dispatch. Wait for the completion notification before collect.",
       "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
       "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
       "Restate every needed fact in the crew task text, because a member starts with an empty conversation.",
       "Let crew action ask use its default file protocol for a long answer, then pull one section with action result.",
-      "Send crew action ask with wait false to every member first, then call action collect for each, to run members in parallel.",
-      "Call crew action collect again when a wait reports that it ran out of budget, because the member keeps working.",
       "Use crew with inline true only for a one-line answer, where a result file costs more than it saves.",
       "Trust only idle and done from crew action status; unknown does not prove that a member finished.",
       "Use crew with action trace, not the terminal, when a member answers badly.",
       "Close a retained member after you collect and inspect its final result. Keep it open only for reuse, correction, or user takeover.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["run", "open", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
         description: "The member operation to run.",
       }),
       member: Type.Optional(
@@ -1078,20 +1048,20 @@ export default function (pi: ExtensionAPI) {
       task: Type.Optional(
         Type.String({
           description:
-            "For run, ask, and open: the full self-contained instruction. The member cannot see this conversation. " +
-            "On run or open it runs as the member's first task, so no separate ask call is needed.",
+            "For ask and open: the full self-contained instruction. The member cannot see this conversation. " +
+            "On open it runs as the member's first task, so no separate ask call is needed.",
         }),
       ),
       context: Type.Optional(
         Type.String({
           description:
-            "For run, ask, and open with a task: extra facts for the brief file, such as file paths, constraints, or prior decisions.",
+            "For ask and open with a task: extra facts for the brief file, such as file paths, constraints, or prior decisions.",
         }),
       ),
       inline: Type.Optional(
         Type.Boolean({
           description:
-            "For run, ask, and open with a task: skip the result file and return the member's reply directly. " +
+            "For ask and open with a task: skip the result file and return the member's reply directly. " +
             "Use it for a one-line answer only.",
         }),
       ),
@@ -1103,57 +1073,40 @@ export default function (pi: ExtensionAPI) {
       max_bytes: Type.Optional(
         Type.Number({ description: "For result: maximum bytes to return. Defaults to 8000." }),
       ),
-      cwd: Type.Optional(Type.String({ description: "For run and open: working directory. Defaults to this session's cwd." })),
+      cwd: Type.Optional(Type.String({ description: "For open: working directory. Defaults to this session's cwd." })),
       layout: Type.Optional(
         StringEnum(["tab", "split"] as const, {
           description:
-            'For run and open: "tab" gives the member a full-width tab and is the default. "split" shares the caller tab.',
+            'For open: "tab" gives the member a full-width tab and is the default. "split" shares the caller tab.',
         }),
       ),
       task_id: Type.Optional(
         Type.String({
           description:
-            "For run, ask, result, and open with a task: task name, which becomes the directory .pi/crew/<task_id>/ in this session's cwd. " +
+            "For ask, result, and open with a task: task name, which becomes the directory .pi/crew/<task_id>/ in this session's cwd. " +
             "Defaults to the member name. Action result accepts it without a member, because a task outlives its member.",
         }),
       ),
       kind: Type.Optional(
-        Type.String({ description: 'For run and open: agent kind such as pi, claude, codex, or gemini. Defaults to "pi".' }),
+        Type.String({ description: 'For open: agent kind such as pi, claude, codex, or gemini. Defaults to "pi".' }),
       ),
       worktree: Type.Optional(
         Type.Boolean({
-          description: "For run and open: create an isolated git worktree and workspace. Use this for a member that writes files.",
+          description: "For open: create an isolated git worktree and workspace. Use this for a member that writes files.",
         }),
       ),
       trust: Type.Optional(
         Type.Boolean({
           description:
-            "For run and open: load project-local .pi settings and extensions in the member. Defaults to false, which ignores them.",
+            "For open: load project-local .pi settings and extensions in the member. Defaults to false, which ignores them.",
         }),
       ),
-      branch: Type.Optional(Type.String({ description: "For run and open with a worktree: branch name. Defaults to crew/<name>." })),
-      base: Type.Optional(Type.String({ description: "For run and open with a worktree: base ref for the new branch." })),
+      branch: Type.Optional(Type.String({ description: "For open with a worktree: branch name. Defaults to crew/<name>." })),
+      base: Type.Optional(Type.String({ description: "For open with a worktree: base ref for the new branch." })),
       keys: Type.Optional(
         Type.Array(Type.String(), { description: 'For keys: logical keys in order, for example ["esc"] or ["ctrl+c"].' }),
       ),
       lines: Type.Optional(Type.Number({ description: "For trace: maximum lines to return. Defaults to 40." })),
-      timeout_ms: Type.Optional(
-        Type.Number({
-          description: "For run, ask, collect, and open with a task: wait budget in milliseconds. Defaults to 600000.",
-        }),
-      ),
-      wait: Type.Optional(
-        Type.Boolean({
-          description:
-            "For run, ask, and open with a task: false returns as soon as the task is sent. " +
-            "Start every parallel member first, then collect each one.",
-        }),
-      ),
-      cleanup: Type.Optional(
-        StringEnum(["after-result", "keep"] as const, {
-          description: 'For run: close after a durable result, or keep the panel open. Defaults to "after-result".',
-        }),
-      ),
       force: Type.Optional(Type.Boolean({ description: "For close: discard uncommitted work in a worktree member." })),
     }),
 
@@ -1171,14 +1124,12 @@ export default function (pi: ExtensionAPI) {
       const name = params.member as string;
 
       switch (params.action) {
-        case "run":
-          return runMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "open":
           return openMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "ask":
           return askMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "collect":
-          return collectMember({ member: name, timeout_ms: params.timeout_ms }, ctx, signal, onUpdate);
+          return collectMember({ member: name }, ctx, signal);
         case "result":
           return readResult(
             { member: params.member, section: params.section, max_bytes: params.max_bytes, task_id: params.task_id },

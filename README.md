@@ -94,59 +94,52 @@ pi install /path/to/pi-herdr-crew
 
 ## The `crew` tool
 
-One tool, nine actions.
+One tool, eight actions.
 
 | Action | What it does |
 |---|---|
-| `run` | Run one task and close the member after a durable result |
-| `open` | Create a tab, or a git worktree, start an agent, and send a first `task` |
-| `ask` | Write a brief, send the task, wait, return the summary line and the result shape |
-| `collect` | Wait for a task sent with `wait=false`, or resume a wait that ran out of budget |
+| `open` | Create a tab or worktree, start an agent, and dispatch an optional first task |
+| `ask` | Write a brief and dispatch a task to an open member |
+| `collect` | Return a settled task summary and result shape without waiting |
 | `result` | List the result sections, or return one named section |
 | `status` | One line per member with live Herdr state |
-| `trace` | The member's tool calls and messages in order |
-| `keys` | Send logical keys such as `esc` or `ctrl+c` to a blocked member |
+| `trace` | Show the member's tool calls and messages |
+| `keys` | Send logical keys such as `esc` or `ctrl+c` |
 | `close` | Close the tab, or remove the worktree |
 
 ### One-task member
 
-Use `run` for the normal one-task path:
+Dispatch one task, wait for the notification, then collect and close:
 
 ```
-crew action=run member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
-crew action=result task_id="error-audit" section="No timeout"
+crew action=open    member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
+crew action=collect member=review-api
+crew action=result  task_id="error-audit" section="No timeout"
+crew action=close   member=review-api
 ```
 
-`run` opens the member, sends the task, waits for a durable result, and closes
-the panel. The result file stays in the orchestrator directory after closure.
+`open` and `ask` return after dispatch. A session-scoped supervisor watches the
+child transcript. It sends a small follow-up message when the task finishes,
+blocks, or loses its pane. The message wakes an idle main agent.
 
-The result states the panel condition:
-
-```
-Panel: closed automatically for member review-api.
-```
-
-The panel stays open when the task is blocked, timed out, missing its result, or
-still active. A dirty worktree also stays open. A cleanup failure does not hide
-the completed task result.
-
-Pass `cleanup="keep"` when the user will take over the panel or the member must
-stay visible. `run` rejects `wait=false` with the default cleanup because no
-later call owns automatic closure.
+`collect` never waits. Call it after the completion notification. It validates
+the result, returns its bounded shape, and clears the pending task.
 
 ### Reusable member
 
 Use the explicit actions when one member must receive more than one task:
 
 ```
-crew action=open   member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
-crew action=result member=review-api section="No timeout"
-crew action=ask    member=review-api task_id="follow-up" task="Check the proposed correction."
-crew action=close  member=review-api
+crew action=open    member=review-api task_id="error-audit" task="Read src/index.ts and audit every unhandled error path."
+crew action=collect member=review-api
+crew action=result  member=review-api section="No timeout"
+crew action=ask     member=review-api task_id="follow-up" task="Check the proposed correction."
+crew action=collect member=review-api
+crew action=close   member=review-api
 ```
 
-Close a retained member after the final result. Keep it open only for reuse,
-correction, or user takeover.
+Close a member after the final result. Keep it open only for reuse, correction,
+or user takeover. Collect each task before you dispatch the next task.
 
 ### Read-only member
 ```
@@ -155,14 +148,12 @@ crew action=result member=review-api section="No timeout"
 crew action=close  member=review-api
 ```
 
-`open` accepts every `ask` field: `task`, `task_id`, `context`, `inline`, `wait`,
-and `timeout_ms`. A `task` on `open` runs as the member's first task, so one call
-replaces `open` then `ask`. Use `ask` for a second or later task on that member.
-Use `run` instead when the member has one task and needs no takeover.
+`open` accepts every `ask` field: `task`, `task_id`, `context`, and `inline`.
+A `task` on `open` runs as the member's first task, so one call replaces `open`
+then `ask`. Use `ask` for a second or later task on that member.
 
-Startup costs a few seconds before the task starts. `wait=false` returns as soon
-as the task is sent, and a wait that runs out of budget keeps the task in flight
-for a later `collect`, so neither path loses the answer.
+Startup costs a few seconds before dispatch. After dispatch, the tool returns at
+once and the supervisor owns completion detection.
 
 `open` creates a full-width tab, because a split shrinks the caller and a narrow
 pane truncates every agent UI. Pass `layout="split"` for a sibling pane in the
@@ -259,21 +250,20 @@ trust dialog, and a worktree path is always new. The extension passes
 `--no-approve`, which ignores project-local `.pi` resources. Pass `trust=true`
 to load them with `--approve`.
 
-**`ask` does not hold one long call.** A single blocking call can exceed the
-parent tool-call budget. The call is then killed, the answer is lost, and the
-member keeps working. So `ask` sends the prompt, then waits separately. Pass
-`wait=false` to return at once, then `collect` each member:
+**`ask` is asynchronous.** It persists the task before dispatch. A supervisor
+then watches the child session file and sends a follow-up message to the main
+agent when the task state changes:
 
 ```
-crew action=open member=a task="..." wait=false
-crew action=open member=b task="..." wait=false
-crew action=status
+crew action=open member=a task="..."
+crew action=open member=b task="..."
+# Each completion notification tells the main agent which member to collect.
 crew action=collect member=a
 crew action=collect member=b
 ```
 
-A wait that runs out of budget reports the live state and keeps the task in
-flight, so a later `collect` still returns the answer.
+The notification contains only the member, task, turn, and state. The result
+stays in its file until the main agent calls `collect` or `result`.
 
 **The settle signal is the child session file, not the Herdr lifecycle.**
 `agent prompt` returns before the child leaves its settled state, so a lifecycle
@@ -292,9 +282,8 @@ tab title instead, and Herdr reports the session path anyway.
 by itself. It reports the dialog and stops. Answer it with `keys` after the user
 decides.
 
-**The user can take over any retained member.** A member is a real pane. Switch
-to it and type. Use `open` or `run` with `cleanup="keep"` when takeover is part
-of the task.
+**The user can take over any open member.** A member is a real pane. Switch to
+it and type. Close it only after its result is durable.
 
 ## Command
 
