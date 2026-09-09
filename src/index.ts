@@ -1028,6 +1028,7 @@ export default function (pi: ExtensionAPI) {
       "Use crew action ask only for a second or later task on an open member.",
       "Crew open and ask return after dispatch. Wait for the completion notification before collect.",
       "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
+      "For worktree open, set cwd to the source Git repository root. Do not use a workspace root, a symlinked checkout, or the current feature worktree.",
       "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
       "Restate every needed fact in the crew task text, because a member starts with an empty conversation.",
       "Let crew action ask use its default file protocol for a long answer, then pull one section with action result.",
@@ -1073,7 +1074,13 @@ export default function (pi: ExtensionAPI) {
       max_bytes: Type.Optional(
         Type.Number({ description: "For result: maximum bytes to return. Defaults to 8000." }),
       ),
-      cwd: Type.Optional(Type.String({ description: "For open: working directory. Defaults to this session's cwd." })),
+      cwd: Type.Optional(
+        Type.String({
+          description:
+            "For open: working directory. Defaults to this session's cwd. " +
+            "With worktree true, pass the source Git repository root that owns the branch and worktrees.",
+        }),
+      ),
       layout: Type.Optional(
         StringEnum(["tab", "split"] as const, {
           description:
@@ -1092,7 +1099,9 @@ export default function (pi: ExtensionAPI) {
       ),
       worktree: Type.Optional(
         Type.Boolean({
-          description: "For open: create an isolated git worktree and workspace. Use this for a member that writes files.",
+          description:
+            "For open: create an isolated git worktree and workspace. Use this for a member that writes files. " +
+            "The cwd must be the source Git repository root, not a workspace root or an existing feature worktree.",
         }),
       ),
       trust: Type.Optional(
