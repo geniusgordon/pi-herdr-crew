@@ -94,11 +94,12 @@ pi install /path/to/pi-herdr-crew
 
 ## The `crew` tool
 
-One tool, eight actions.
+One tool, nine actions.
 
 | Action | What it does |
 |---|---|
 | `open` | Create a tab or worktree, start an agent, and dispatch an optional first task |
+| `adopt` | Transfer a live member to this Pi session after confirmation |
 | `ask` | Write a brief and dispatch a task to an open member |
 | `collect` | Return a settled task summary and result shape without waiting |
 | `result` | List the result sections, or return one named section |
@@ -237,9 +238,17 @@ deletes the branch.
 **A member starts with an empty conversation.** It cannot see the parent session.
 Put every needed fact in the task text.
 
-**A member outlives its parent.** A new or reloaded parent calls `herdr agent list`
-and adopts every named agent it does not know. `status` marks such a member
-`adopted`. Adoption also reclaims a name left behind by a failed `open`.
+**A member outlives its parent.** A new or reloaded parent reconnects live
+members owned by the same Pi session. The ownership record uses the child
+session path to reject a different agent with the same name.
+
+**Ownership is isolated by Pi session.** `status` and automatic reconnect ignore
+members owned by other sessions. Use `adopt` to transfer a live member after a
+confirmation. A generation check lets only one concurrent transfer succeed.
+
+**Notifications follow ownership.** A watcher checks the owner and generation
+while it sends a notification. A transfer invalidates the old watcher before it
+can send a later notification.
 
 **Member state comes from Herdr, not from a promise.** `idle`, `working`,
 `blocked`, `done`, `unknown`. Trust `idle` and `done`. `unknown` does not prove

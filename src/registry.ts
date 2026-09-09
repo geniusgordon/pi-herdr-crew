@@ -8,6 +8,12 @@
 
 export type Member = {
   name: string;
+  /** Stable ownership identity for cross-session isolation and watcher invalidation. */
+  ownership?: {
+    memberId: string;
+    ownerSessionId: string;
+    generation: number;
+  };
   paneId: string;
   workspaceId: string;
   /** Set for a tab member and a worktree member. Closing a tab member closes this tab. */
@@ -75,6 +81,10 @@ export class MemberRegistry {
 
   put(member: Member): void {
     this.members.set(member.name, member);
+  }
+
+  discard(name: string): void {
+    this.members.delete(name);
   }
 
   get(name: string): Member {

@@ -17,6 +17,9 @@
  * summary line. Measured on a 12283 byte audit, this context took 124 bytes.
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -43,6 +46,7 @@ import {
   pickDirection,
   type Exec,
 } from "./herdr.js";
+import { OwnershipConflictError, OwnershipStore, type OwnershipIdentity, type OwnershipRecord } from "./ownership.js";
 import {
   CREW_ROOT,
   findLatestResult,
@@ -62,6 +66,7 @@ import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const START_TIMEOUT_MS = 60_000;
 const SHELL_READY_TIMEOUT_MS = 15_000;
+const OWNERSHIP_ROOT = join(homedir(), ".pi", "agent", "crew", "ownership");
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean };
 
@@ -87,7 +92,10 @@ function sleep(ms: number): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
   const registry = new MemberRegistry();
+  const ownership = new OwnershipStore(OWNERSHIP_ROOT);
   const watchers = new Map<string, AbortController>();
+  const ownershipWrites = new Map<string, Promise<void>>();
+  let ownerSessionId = "";
   const exec: Exec = (command, args, options) => pi.exec(command, args, options);
 
   // ---------------------------------------------------------------- lifecycle
@@ -97,7 +105,13 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("herdr-crew", undefined);
       return;
     }
+    ownerSessionId = ctx.sessionManager.getSessionId();
     registry.restore(ctx.sessionManager.getEntries());
+    for (const member of registry.openMembers()) {
+      const identity = ownershipIdentity(member);
+      if (!identity || !(await ownership.isCurrent(identity))) registry.discard(member.name);
+    }
+    await adoptMembers();
     refreshStatus(ctx);
     for (const member of registry.openMembers()) {
       if (member.pending) watchPending(member.name);
@@ -107,6 +121,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     for (const controller of watchers.values()) controller.abort();
     watchers.clear();
+    await Promise.allSettled(ownershipWrites.values());
+    ownershipWrites.clear();
   });
 
   function refreshStatus(ctx: ExtensionContext): void {
@@ -114,21 +130,92 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("herdr-crew", open.length ? `members: ${open.map((m) => m.name).join(" ")}` : undefined);
   }
 
+  function queueOwnershipWrite(member: Member, reportError: boolean): Promise<void> {
+    const identity = ownershipIdentity(member);
+    if (!identity) return Promise.resolve();
+    const previous = ownershipWrites.get(member.name) ?? Promise.resolve();
+    const write = previous.then(() => ownership.saveMember(identity, member)).then(() => undefined);
+    const tracked = reportError
+      ? write.catch((error) => console.error(`Crew ownership persistence failed for ${member.name}:`, error))
+      : write;
+    ownershipWrites.set(member.name, tracked);
+    void tracked.finally(() => {
+      if (ownershipWrites.get(member.name) === tracked) ownershipWrites.delete(member.name);
+    }).catch(() => {});
+    return tracked;
+  }
+
   function persist(member: Member): void {
     registry.put(member);
     pi.appendEntry(CREW_ENTRY, member);
+    void queueOwnershipWrite(member, true);
+  }
+
+  async function persistDurably(member: Member): Promise<void> {
+    const previous = registry.openNames().includes(member.name) ? registry.get(member.name) : undefined;
+    try {
+      await queueOwnershipWrite(member, false);
+      registry.put(member);
+      pi.appendEntry(CREW_ENTRY, member);
+    } catch (error) {
+      if (previous) registry.put(previous);
+      else registry.discard(member.name);
+      throw error;
+    }
+  }
+
+  async function flushOwnership(name: string): Promise<void> {
+    await ownershipWrites.get(name);
+  }
+
+  function ownershipIdentity(member: Member): OwnershipIdentity | undefined {
+    return member.ownership
+      ? { memberName: member.name, ...member.ownership }
+      : undefined;
+  }
+
+  function owns(record: OwnershipRecord): boolean {
+    return record.ownerSessionId === ownerSessionId;
   }
 
   // ------------------------------------------------------------------ actions
 
-  /**
-   * Adopt every named Herdr agent that this registry does not know yet.
-   *
-   * Herdr, not this session, owns member liveness. A member outlives its parent, so
-   * a new or reloaded parent must find it again. `agent list` already reports
-   * the name, the pane, the cwd, and the session file, which is everything a
-   * clean read needs. A half-finished open leaves the same state behind.
-   */
+  async function memberFromAgent(agent: any, record: OwnershipRecord, signal?: AbortSignal): Promise<Member> {
+    const saved = record.member && typeof record.member === "object" ? record.member as Partial<Member> : undefined;
+    const member: Member = {
+      ...saved,
+      name: record.memberName,
+      ownership: {
+        memberId: record.memberId,
+        ownerSessionId: record.ownerSessionId,
+        generation: record.generation,
+      },
+      paneId: String(agent.pane_id),
+      workspaceId: String(agent.workspace_id),
+      tabId: typeof agent.tab_id === "string" ? agent.tab_id : undefined,
+      sessionPath: record.sessionPath as string,
+      cwd: String(agent.cwd ?? ""),
+      kind: String(agent.agent ?? "pi"),
+      openedAt: saved?.openedAt ?? record.updatedAt,
+      adopted: true,
+    };
+
+    if (member.cwd) {
+      const list = await herdr(exec, ["worktree", "list", "--cwd", member.cwd], { signal, timeoutMs: 15_000 }).catch(
+        () => undefined,
+      );
+      const match = (list?.worktrees ?? []).find(
+        (wt: any) => wt?.is_linked_worktree && wt?.open_workspace_id === member.workspaceId,
+      );
+      if (match) {
+        member.worktree = { path: String(match.path), branch: String(match.branch), workspaceId: member.workspaceId };
+      }
+    }
+
+    return member;
+  }
+
+  /** Adopt live Herdr agents that belong to the current Pi session. */
   async function adoptMembers(signal?: AbortSignal): Promise<Member[]> {
     const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
     const known = new Set(registry.openNames());
@@ -139,48 +226,28 @@ export default function (pi: ExtensionAPI) {
       const sessionPath = agent?.agent_session?.value;
       if (typeof name !== "string" || known.has(name)) continue;
 
-      const member: Member = {
-        name,
-        paneId: String(agent.pane_id),
-        workspaceId: String(agent.workspace_id),
-        tabId: typeof agent.tab_id === "string" ? agent.tab_id : undefined,
-        sessionPath: typeof sessionPath === "string" && sessionPath.startsWith("/") ? sessionPath : "",
-        cwd: String(agent.cwd ?? ""),
-        kind: String(agent.agent ?? "pi"),
-        openedAt: new Date().toISOString(),
-        adopted: true,
-      };
+      const record = await ownership.get(name).catch(() => undefined);
+      if (!record || !owns(record) || record.state !== "active") continue;
+      if (record.sessionPath !== sessionPath) continue;
 
-      // A worktree member sits in its own workspace. Match on that workspace id.
-      if (member.cwd) {
-        const list = await herdr(exec, ["worktree", "list", "--cwd", member.cwd], { signal, timeoutMs: 15_000 }).catch(
-          () => undefined,
-        );
-        const match = (list?.worktrees ?? []).find(
-          (wt: any) => wt?.is_linked_worktree && wt?.open_workspace_id === member.workspaceId,
-        );
-        if (match) {
-          member.worktree = { path: String(match.path), branch: String(match.branch), workspaceId: member.workspaceId };
-        }
-      }
-
+      const member = await memberFromAgent(agent, record, signal);
       persist(member);
+      known.add(name);
       adopted.push(member);
     }
 
     return adopted;
   }
 
-  /**
-   * Resolve a member against live Herdr state.
-   *
-   * Never trust the cached pane id or session path. A pane move changes the pane
-   * id, and a member that started at a dialog reports its session file only after
-   * it reaches its prompt. One `agent get` call keeps both fields current.
-   */
+  /** Resolve a member and verify its durable child-session incarnation. */
   async function resolveMember(name: string, signal?: AbortSignal): Promise<Member> {
     if (!registry.openNames().includes(name)) await adoptMembers(signal);
     const member = registry.get(name);
+    const identity = ownershipIdentity(member);
+    if (!identity || !(await ownership.isCurrent(identity))) {
+      registry.discard(name);
+      throw new Error(`Member "${name}" belongs to another Pi session. Use action "adopt" for recovery.`);
+    }
 
     const live = await herdr(exec, ["agent", "get", name], { signal, timeoutMs: 10_000 }).catch(() => undefined);
     const agent = live?.agent;
@@ -189,9 +256,14 @@ export default function (pi: ExtensionAPI) {
     const paneId = typeof agent.pane_id === "string" ? agent.pane_id : member.paneId;
     const tabId = typeof agent.tab_id === "string" ? agent.tab_id : member.tabId;
     const reported = agent.agent_session?.value;
-    const sessionPath = typeof reported === "string" && reported.startsWith("/") ? reported : member.sessionPath;
+    const record = await ownership.get(name);
+    if (!record?.sessionPath || record.sessionPath !== reported) {
+      registry.discard(name);
+      throw new Error(`Member "${name}" has a different child session. Use action "adopt" only after inspecting it.`);
+    }
+    const sessionPath = record.sessionPath;
 
-    if (paneId === member.paneId && tabId === member.tabId && sessionPath === member.sessionPath) return member;
+    if (paneId === member.paneId && tabId === member.tabId) return member;
 
     const refreshed: Member = { ...member, paneId, tabId, sessionPath };
     persist(refreshed);
@@ -224,18 +296,20 @@ export default function (pi: ExtensionAPI) {
     return (await sourceWorkspace(cwd, signal)) ?? callerWorkspace();
   }
 
-  /** Clear a name Herdr still holds after a failed open, instead of deadlocking on it. */
-  async function reconcileName(name: string, signal?: AbortSignal): Promise<string | undefined> {
+  /** Refuse a name held by any live Herdr agent. Recovery must be explicit. */
+  async function reconcileName(name: string, signal?: AbortSignal): Promise<void> {
     const live = await herdr(exec, ["agent", "list"], { signal, timeoutMs: 15_000 }).catch(() => ({ agents: [] }));
     const held = (live.agents ?? []).find((agent: any) => agent?.name === name);
-    if (!held) return undefined;
-
-    if (registry.openNames().includes(name)) {
-      throw new Error(`Member "${name}" is already open in ${held.pane_id}. Use action "ask", or pick another name.`);
+    const record = await ownership.get(name).catch(() => undefined);
+    if (!held) {
+      if (record) {
+        throw new Error(`Member "${name}" has an ownership reservation but no live pane. Use another name.`);
+      }
+      return;
     }
 
-    await herdr(exec, ["pane", "close", held.pane_id], { signal, timeoutMs: 30_000 });
-    return held.pane_id;
+    const owner = record ? ` Owner session: ${record.ownerSessionId}.` : " It has no ownership record.";
+    throw new Error(`Member "${name}" is already live in ${held.pane_id}.${owner} Use action "adopt" for recovery.`);
   }
 
   async function openMember(
@@ -263,8 +337,8 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`Member "${name}" is already open. Use action "ask" or pick another name.`);
     }
 
-    const reclaimed = await reconcileName(name, signal);
-    if (reclaimed) onUpdate?.(ok(`Reclaimed the name ${name} from orphan pane ${reclaimed}.`));
+    await reconcileName(name, signal);
+    let ownershipRecord = await ownership.reserve({ memberName: name, ownerSessionId });
 
     // The directory the parent asked for. A worktree member then runs somewhere
     // else, so memberCwd below is the value that matters for the file protocol.
@@ -273,12 +347,15 @@ export default function (pi: ExtensionAPI) {
     const layout = params.layout ?? "tab";
 
     let memberCwd = cwd;
-    let paneId: string;
-    let workspaceId: string;
+    let paneId: string | undefined;
+    let workspaceId: string | undefined;
     let tabId: string | undefined;
     let worktree: Member["worktree"];
+    let sessionPath: string | undefined;
+    let status: string | undefined;
 
-    if (params.worktree) {
+    try {
+      if (params.worktree) {
       // Herdr groups a worktree workspace under the source repository. Pass the
       // source workspace so the new one lands beside its parent, not at the end
       // of the workspace list.
@@ -341,12 +418,10 @@ export default function (pi: ExtensionAPI) {
     // noise on every member start. The session path comes back from Herdr, so the
     // member never needs a predictable id. The name shows in the footer and the
     // tab title instead.
-    const trustFlag = params.trust ? "--approve" : "--no-approve";
-    const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `member: ${name}`] : [];
+      const trustFlag = params.trust ? "--approve" : "--no-approve";
+      const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `member: ${name}`] : [];
 
-    let sessionPath: string;
-    let status: string;
-    try {
+      if (!paneId) throw new Error(`Herdr did not create a pane for member ${name}.`);
       const started = await startAgent(name, kind, paneId, childArgs, signal);
 
       const reported = started.agent?.agent_session?.value;
@@ -358,6 +433,7 @@ export default function (pi: ExtensionAPI) {
       }
       sessionPath = reported;
       status = String(started.agent?.agent_status ?? "unknown");
+      ownershipRecord = await ownership.activate(ownershipRecord, { paneId, sessionPath });
     } catch (error) {
       // Never leave an orphan pane. It also deadlocks the member name.
       if (params.worktree && worktree) {
@@ -366,14 +442,25 @@ export default function (pi: ExtensionAPI) {
         }).catch(() => {});
       } else if (layout === "tab" && tabId) {
         await herdr(exec, ["tab", "close", tabId], { timeoutMs: 15_000 }).catch(() => {});
-      } else {
+      } else if (paneId) {
         await herdr(exec, ["pane", "close", paneId], { timeoutMs: 15_000 }).catch(() => {});
       }
+      await ownership.release(ownershipRecord).catch(() => {});
       throw error;
     }
 
+    if (!paneId || !workspaceId || !sessionPath || !status) {
+      throw new Error(`Member ${name} did not finish startup.`);
+    }
+
     const member: Member = {
-      name, paneId, workspaceId, tabId, sessionPath, kind, worktree,
+      name,
+      ownership: {
+        memberId: ownershipRecord.memberId,
+        ownerSessionId: ownershipRecord.ownerSessionId,
+        generation: ownershipRecord.generation,
+      },
+      paneId, workspaceId, tabId, sessionPath, kind, worktree,
       cwd: memberCwd,
       layout: params.worktree ? "worktree" : layout,
       openedAt: new Date().toISOString(),
@@ -495,14 +582,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
-    persist({ ...member, task: taskId, turns: turn, lastResult: pending.result, pending });
+    const pendingMember = { ...member, task: taskId, turns: turn, lastResult: pending.result, pending };
+    await persistDurably(pendingMember);
 
-    // Dispatch once. The session-scoped supervisor watches completion after this call returns.
+    // Dispatch while this session still owns the member. A transfer waits for the prompt attempt.
     try {
-      await herdr(exec, ["agent", "prompt", member.name, prompt], { signal, timeoutMs: 30_000 });
+      const identity = ownershipIdentity(pendingMember) as OwnershipIdentity;
+      await ownership.runIfCurrent(identity, () =>
+        herdr(exec, ["agent", "prompt", member.name, prompt], { signal, timeoutMs: 30_000 }),
+      );
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
-        persist(rollbackDispatch(member, pending));
+        await persistDurably(rollbackDispatch(member, pending));
         const tail = await tailPane(member.paneId, 30);
         return ok(
           [
@@ -795,6 +886,8 @@ export default function (pi: ExtensionAPI) {
   /** Start one session-scoped watcher for a detached member task. */
   function watchPending(memberName: string): void {
     if (watchers.has(memberName)) return;
+    const member = registry.get(memberName);
+    if (!ownershipIdentity(member)) return;
 
     const controller = new AbortController();
     watchers.set(memberName, controller);
@@ -808,6 +901,8 @@ export default function (pi: ExtensionAPI) {
     let tick = 0;
     while (!signal.aborted) {
       const member = registry.get(memberName);
+      const identity = ownershipIdentity(member);
+      if (!identity || !(await ownership.isCurrent(identity))) return;
       const pending = member.pending;
       if (!pending) return;
 
@@ -826,25 +921,28 @@ export default function (pi: ExtensionAPI) {
               ? `Inspect member "${member.name}", answer its dialog with action "keys", then wait for the next notification.`
               : `Call crew with action "collect" and member "${member.name}" to inspect the lost task.`;
           try {
-            pi.sendMessage(
-              {
-                customType: "herdr-crew-event",
-                content: `Crew task ${pending.taskId} is ${state}. ${action}`,
-                display: true,
-                details: { member: member.name, taskId: pending.taskId, turn: pending.turn, state },
-              },
-              { deliverAs: "followUp", triggerTurn: true },
-            );
+            const updatedMember = { ...current, pending: { ...current.pending, notifiedState: state } } as Member;
+            await ownership.runAndSave(identity, () => {
+              pi.sendMessage(
+                {
+                  customType: "herdr-crew-event",
+                  content: `Crew task ${pending.taskId} is ${state}. ${action}`,
+                  display: true,
+                  details: { member: member.name, taskId: pending.taskId, turn: pending.turn, state },
+                },
+                { deliverAs: "followUp", triggerTurn: true },
+              );
+              return { result: undefined, member: updatedMember };
+            });
+            registry.put(updatedMember);
+            pi.appendEntry(CREW_ENTRY, updatedMember);
           } catch (error) {
+            if (error instanceof OwnershipConflictError) return;
             console.error(`Crew notification failed for ${memberName}:`, error);
             await sleep(1_000);
             continue;
           }
 
-          const delivered = registry.get(memberName);
-          if (!isSamePending(delivered.pending, pending)) return;
-          const updatedPending: Pending = { ...delivered.pending, notifiedState: state };
-          persist({ ...delivered, pending: updatedPending });
         }
         if (state !== "blocked") return;
       } else if (pending.notifiedState === "blocked" && isLiveObservation(outcome)) {
@@ -897,8 +995,82 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function adoptMember(
+    params: { member: string },
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    const name = params.member;
+    assertMemberName(name);
+    if (registry.openNames().includes(name)) {
+      return ok(`Member ${name} already belongs to this Pi session.`);
+    }
+
+    const live = await herdr(exec, ["agent", "get", name], { signal, timeoutMs: 10_000 }).catch(() => undefined);
+    const agent = live?.agent;
+    let record = await ownership.get(name);
+    if (!agent) {
+      if (!record) throw new Error(`Member "${name}" has no live Herdr agent or ownership record.`);
+      const confirmed = await ctx.ui.confirm(
+        "Release stale ownership",
+        `Member ${name} has no live pane. Release its ownership record?`,
+      );
+      if (!confirmed) return ok(`Ownership for member ${name} was not released.`);
+      await ownership.release(record);
+      return ok(`Released stale ownership for member ${name}. You can open that name again.`);
+    }
+    const sessionPath = agent.agent_session?.value;
+    if (typeof sessionPath !== "string" || !sessionPath.startsWith("/")) {
+      throw new Error(`Member "${name}" reports no session file, so ownership cannot be verified.`);
+    }
+
+    if (record?.sessionPath && record.sessionPath !== sessionPath) {
+      throw new Error(`Member "${name}" does not match its ownership record. Close the stale pane or use another name.`);
+    }
+    if (record?.state === "opening") {
+      record = await ownership.activate(record, { paneId: String(agent.pane_id), sessionPath });
+    }
+
+    if (!record) {
+      const confirmed = await ctx.ui.confirm(
+        "Adopt unowned member",
+        `Member ${name} has no ownership record. Assign it to this Pi session?`,
+      );
+      if (!confirmed) return ok(`Member ${name} was not adopted.`);
+      record = await ownership.reserve({ memberName: name, ownerSessionId });
+      record = await ownership.activate(record, { paneId: String(agent.pane_id), sessionPath });
+    } else if (!owns(record)) {
+      const confirmed = await ctx.ui.confirm(
+        "Transfer crew member",
+        `Transfer ${name} from Pi session ${record.ownerSessionId} to this session?`,
+      );
+      if (!confirmed) return ok(`Member ${name} was not adopted.`);
+      record = await ownership.transfer(record, ownerSessionId);
+    }
+
+    const member = await memberFromAgent(agent, record, signal);
+    persist(member);
+    if (member.pending) watchPending(member.name);
+    refreshStatus(ctx);
+    return ok(
+      [
+        `Member ${name} now belongs to this Pi session.`,
+        `  pane    ${member.paneId}`,
+        `  cwd     ${member.cwd}`,
+        `  owner   ${ownerSessionId}`,
+        `  version ${record.generation}`,
+      ].join("\n"),
+      { member: name, adopted: true, generation: record.generation },
+    );
+  }
+
   async function statusCrew(ctx: ExtensionContext, signal?: AbortSignal): Promise<ToolResult> {
+    for (const member of registry.openMembers()) {
+      const identity = ownershipIdentity(member);
+      if (!identity || !(await ownership.isCurrent(identity))) registry.discard(member.name);
+    }
     await adoptMembers(signal);
+    refreshStatus(ctx);
 
     const open = registry.openMembers();
     if (!open.length) return ok(`No member is open. Use action "open".`);
@@ -955,10 +1127,13 @@ export default function (pi: ExtensionAPI) {
     const keys = params.keys ?? [];
     if (!keys.length) throw new Error(`Action "keys" needs at least one logical key, for example ["esc"] or ["ctrl+c"].`);
 
-    await herdr(exec, ["agent", "send-keys", member.name, ...keys], { signal, timeoutMs: 15_000 });
+    const identity = ownershipIdentity(member) as OwnershipIdentity;
+    await ownership.runIfCurrent(identity, () =>
+      herdr(exec, ["agent", "send-keys", member.name, ...keys], { signal, timeoutMs: 15_000 }),
+    );
     const current = registry.get(member.name);
     if (current.pending?.notifiedState === "blocked") {
-      persist({ ...current, pending: { ...current.pending, notifiedState: undefined } });
+      await persistDurably({ ...current, pending: { ...current.pending, notifiedState: undefined } });
     }
     await sleep(400);
     return ok([`Sent ${keys.join(" ")} to ${member.name}. State: ${await memberState(member)}.`, "", await tailPane(member.paneId, 20)].join("\n"));
@@ -972,61 +1147,40 @@ export default function (pi: ExtensionAPI) {
     const member = await resolveMember(params.member, signal);
     const notes: string[] = [];
 
-    // A member whose pane already died needs bookkeeping only. Closing its pane
-    // fails, and that failure would leave the member open forever.
-    if ((await memberState(member)) === "gone" && !member.worktree) {
-      registry.markClosed(member.name);
-      watchers.get(member.name)?.abort();
-      watchers.delete(member.name);
-      pi.appendEntry(CREW_ENTRY, { ...member, closed: true, pending: undefined });
-      refreshStatus(ctx);
-      return ok(
-        [
-          `Member ${member.name} is closed. Its pane was already gone.`,
-          member.sessionPath ? `Transcript stays readable at ${member.sessionPath}.` : "",
-        ]
-          .filter((line) => line !== "")
-          .join("\n"),
-      );
-    }
-
-    if (member.worktree) {
-      const args = ["worktree", "remove", "--workspace", member.worktree.workspaceId];
-      if (params.force) args.push("--force");
-      try {
+    const identity = ownershipIdentity(member) as OwnershipIdentity;
+    await ownership.runAndRelease(identity, async () => {
+      if ((await memberState(member)) === "gone" && !member.worktree) {
+        notes.push("__gone__");
+      } else if (member.worktree) {
+        const args = ["worktree", "remove", "--workspace", member.worktree.workspaceId];
+        if (params.force) args.push("--force");
         await herdr(exec, args, { signal, timeoutMs: 60_000 });
         notes.push(`Removed the worktree at ${member.worktree.path}.`);
         notes.push(`Branch ${member.worktree.branch} still exists. Herdr does not delete it.`);
-      } catch (error) {
-        if (error instanceof HerdrError && error.code === "dirty_worktree_requires_force") {
-          return ok(
-            [
-              `Member ${member.name} has uncommitted work in ${member.worktree.path}.`,
-              `The member stays open. Commit or merge that work first.`,
-              `To discard it, call action "close" again with force true.`,
-            ].join("\n"),
-            { dirty: true, member: member.name },
-          );
-        }
-        throw error;
+      } else if (await ownsWholeTab(member, signal)) {
+        const tabId = member.tabId as string;
+        await herdr(exec, ["tab", "close", tabId], { signal, timeoutMs: 30_000 });
+        notes.push(`Closed tab ${tabId}.`);
+      } else {
+        await herdr(exec, ["pane", "close", member.paneId], { signal, timeoutMs: 30_000 });
+        notes.push(`Closed pane ${member.paneId}.`);
       }
-    } else if (await ownsWholeTab(member, signal)) {
-      // Close the tab when the member is its only pane. Decide from live state, not
-      // from the stored layout, because an adopted member has no stored layout.
-      const tabId = member.tabId as string;
-      await herdr(exec, ["tab", "close", tabId], { signal, timeoutMs: 30_000 });
-      notes.push(`Closed tab ${tabId}.`);
-    } else {
-      await herdr(exec, ["pane", "close", member.paneId], { signal, timeoutMs: 30_000 });
-      notes.push(`Closed pane ${member.paneId}.`);
-    }
+    }).catch((error) => {
+      if (error instanceof HerdrError && error.code === "dirty_worktree_requires_force") {
+        throw new Error(`Member ${member.name} has uncommitted work. Commit it, or close with force true.`);
+      }
+      throw error;
+    });
 
+    const wasGone = notes[0] === "__gone__";
+    if (wasGone) notes.shift();
     registry.markClosed(member.name);
     watchers.get(member.name)?.abort();
     watchers.delete(member.name);
-    pi.appendEntry(CREW_ENTRY, { ...member, closed: true });
+    pi.appendEntry(CREW_ENTRY, { ...member, closed: true, pending: undefined });
     refreshStatus(ctx);
 
+    if (wasGone) notes.push("Its pane was already gone.");
     if (member.sessionPath) notes.push(`Transcript stays readable at ${member.sessionPath}.`);
     return ok([`Member ${member.name} is closed.`, ...notes].join("\n"));
   }
@@ -1042,6 +1196,7 @@ export default function (pi: ExtensionAPI) {
       "Actions:\n" +
       "  open   - create a tab or worktree, start an agent, and dispatch an optional first task\n" +
       "  ask     - write a brief and dispatch a task to an open member\n" +
+      "  adopt   - explicitly transfer a live member to this Pi session\n" +
       "  collect - return a settled task summary and result shape without waiting\n" +
       "  result  - list the result file sections, or return one named section\n" +
       "  status - one line per member with live Herdr state: idle, working, blocked, done\n" +
@@ -1052,6 +1207,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
       "Use crew with action open to create a member and dispatch its first task.",
+      "Use crew action adopt only for explicit recovery of a live member owned by another Pi session.",
       "Use crew action ask only for a second or later task on an open member.",
       "Crew open and ask return after dispatch. Wait for the completion notification before collect.",
       "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
@@ -1065,12 +1221,12 @@ export default function (pi: ExtensionAPI) {
       "Close a retained member after you collect and inspect its final result. Keep it open only for reuse, correction, or user takeover.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["open", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "adopt", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
         description: "The member operation to run.",
       }),
       member: Type.Optional(
         Type.String({
-          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status.',
+          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status. Adopt transfers ownership after confirmation.',
         }),
       ),
       task: Type.Optional(
@@ -1162,6 +1318,8 @@ export default function (pi: ExtensionAPI) {
       switch (params.action) {
         case "open":
           return openMember({ ...params, member: name }, ctx, signal, onUpdate);
+        case "adopt":
+          return adoptMember({ member: name }, ctx, signal);
         case "ask":
           return askMember({ ...params, member: name }, ctx, signal, onUpdate);
         case "collect":
