@@ -9,6 +9,43 @@ export type WatchOutcome =
 
 export type PendingIdentity = Pick<Pending, "taskId" | "turn">;
 
+export type CompletionObservation = {
+  baseline: number;
+  turnCount: number;
+  state: string;
+  resultExpected: boolean;
+  resultExists: boolean;
+  followUpPending?: boolean;
+  settledForMs?: number;
+};
+
+export const INLINE_SETTLE_MS = 2_000;
+
+/** Require a new turn, a settled member, and the expected result artifact. */
+export function classifyTaskCompletion(observation: CompletionObservation): WatchOutcome {
+  if (observation.state === "blocked") return { kind: "blocked" };
+  if (observation.state === "gone") return { kind: "pending", state: "gone" };
+  if (observation.turnCount <= observation.baseline) {
+    return { kind: "pending", state: observation.state };
+  }
+  if (observation.state !== "idle" && observation.state !== "done") {
+    return { kind: "pending", state: observation.state };
+  }
+  if (observation.followUpPending) return { kind: "pending", state: observation.state };
+  if (!observation.resultExpected && (observation.settledForMs ?? 0) < INLINE_SETTLE_MS) {
+    return { kind: "pending", state: observation.state };
+  }
+  if (observation.resultExpected && !observation.resultExists) {
+    return { kind: "pending", state: observation.state };
+  }
+  return { kind: "done" };
+}
+
+/** Clear task ownership only after result collection succeeds. */
+export function finalizeCollectedTask(member: Member, succeeded: boolean): Member {
+  return succeeded ? { ...member, pending: undefined } : member;
+}
+
 /** Match a current pending task against the watcher task. */
 export function isSamePending(current: Pending | undefined, watched: PendingIdentity): current is Pending {
   return current?.taskId === watched.taskId && current.turn === watched.turn;
@@ -42,7 +79,7 @@ export function notificationState(outcome: WatchOutcome): SettledState | undefin
 }
 
 export function shouldCheckState(pending: Pending, tick: number): boolean {
-  return pending.notifiedState === "blocked" || tick % 5 === 0;
+  return pending.notifiedState === "blocked" || pending.settledAt !== undefined || tick % 5 === 0;
 }
 
 export function isLiveObservation(outcome: WatchOutcome): boolean {

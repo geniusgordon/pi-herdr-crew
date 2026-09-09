@@ -21,6 +21,10 @@ export type Transcript = {
   /** Tool names in call order. */
   toolNames: string[];
   turnCount: number;
+  /** True when an active background task can start an automatic follow-up turn. */
+  followUpPending: boolean;
+  /** Epoch time of the newest completed turn. */
+  lastTurnAtMs?: number;
   lastDurationMs?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -39,6 +43,9 @@ export async function readTranscript(sessionPath: string): Promise<Transcript> {
   const turns: Turn[] = [];
   const toolNames: string[] = [];
   let turnCount = 0;
+  const followUpTasks = new Set<string>();
+  let followUpAwaitingTurn = false;
+  let lastTurnAtMs: number | undefined;
   let lastDurationMs: number | undefined;
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
@@ -55,15 +62,36 @@ export async function readTranscript(sessionPath: string): Promise<Transcript> {
 
     if (entry.type === "custom" && entry.customType === "zentui-turn-summary") {
       turnCount += 1;
+      followUpAwaitingTurn = false;
+      const timestamp = Date.parse(String(entry.timestamp ?? ""));
+      lastTurnAtMs = Number.isNaN(timestamp) ? undefined : timestamp;
       lastDurationMs = entry.data?.durationMs;
       inputTokens = entry.data?.input;
       outputTokens = entry.data?.output;
       continue;
     }
 
+    if (entry.type === "custom_message" && entry.customType === "background-task-notification") {
+      const taskId = String(entry.details?.id ?? "");
+      if (taskId && followUpTasks.delete(taskId)) followUpAwaitingTurn = true;
+      continue;
+    }
+
     if (entry.type !== "message") continue;
 
     const message = entry.message ?? {};
+    if (message.role === "toolResult" && message.toolName === "bg_run") {
+      const task = message.details?.task;
+      if (
+        typeof task?.id === "string" &&
+        task.status === "running" &&
+        task.notifyOnCompletion === true &&
+        task.triggerOnCompletion === true
+      ) {
+        followUpTasks.add(task.id);
+      }
+    }
+
     const content: any[] = Array.isArray(message.content) ? message.content : [];
     const turn: Turn = { role: String(message.role ?? "unknown"), text: "", toolCalls: [] };
 
@@ -89,7 +117,17 @@ export async function readTranscript(sessionPath: string): Promise<Transcript> {
     }
   }
 
-  return { turns, final, toolNames, turnCount, lastDurationMs, inputTokens, outputTokens };
+  return {
+    turns,
+    final,
+    toolNames,
+    turnCount,
+    followUpPending: followUpAwaitingTurn || followUpTasks.size > 0,
+    lastTurnAtMs,
+    lastDurationMs,
+    inputTokens,
+    outputTokens,
+  };
 }
 
 /** One line per step: what the child did, in order. No terminal noise. */

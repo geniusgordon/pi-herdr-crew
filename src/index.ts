@@ -24,6 +24,8 @@ import { Type } from "typebox";
 
 import {
   assertCanDispatch,
+  classifyTaskCompletion,
+  finalizeCollectedTask,
   isLiveObservation,
   isSamePending,
   notificationState,
@@ -543,7 +545,7 @@ export default function (pi: ExtensionAPI) {
     const taskId = pending.taskId;
     const paths = taskPaths(ctx.cwd, taskId, pending.turn);
     const useFile = pending.result !== undefined;
-    const outcome = await inspectTurn(member, pending.baseline);
+    const outcome = await inspectTurn(member, pending);
 
     // A lost pane is not a slow member, so say so. The task cannot finish.
     if (outcome.kind === "pending" && outcome.state === "gone") {
@@ -596,27 +598,21 @@ export default function (pi: ExtensionAPI) {
       .filter(Boolean)
       .join(" · ");
 
-    // The task settled, so it is no longer in flight. Clear it before returning,
-    // or a later collect waits on work that already finished.
-    persist({ ...member, pending: undefined });
-    refreshStatus(ctx);
-
     if (useFile) {
       const info = await inspectResult(paths.result, ctx.cwd);
 
-      // A member that ignored the brief still answered. Fall back to its reply
-      // instead of losing the work.
       if (!info.exists) {
         return ok(
           [
-            `Member ${member.name} wrote no ${info.relative}.`,
-            transcript.final ? `Its reply follows.\n\n${transcript.final}` : `It produced no reply either.`,
-            "",
-            `--- ${meta} · no-result-file`,
+            `Member ${member.name} is settled, but ${info.relative} does not exist yet.`,
+            `Task ${taskId} stays pending. Wait for the completion notification.`,
           ].join("\n"),
-          { member: member.name, state, resultMissing: true },
+          { member: member.name, state, resultMissing: true, pending: true },
         );
       }
+
+      persist(finalizeCollectedTask(member, true));
+      refreshStatus(ctx);
 
       const files = await listTaskFiles(ctx.cwd, taskId);
       const extras = files.filter((file) => !/^(brief|result)(-\d+)?\.md$/.test(file.name));
@@ -637,6 +633,9 @@ export default function (pi: ExtensionAPI) {
         { member: member.name, state, task: taskId, result: info },
       );
     }
+
+    persist(finalizeCollectedTask(member, true));
+    refreshStatus(ctx);
 
     if (!transcript.final) {
       return ok(
@@ -754,15 +753,43 @@ export default function (pi: ExtensionAPI) {
     | { kind: "pending"; state: string };
 
   /** Inspect one child turn without making the caller wait. */
-  async function inspectTurn(member: Member, baseline: number, checkState = true): Promise<Outcome> {
-    const empty: Transcript = { turns: [], toolNames: [], turnCount: 0 };
+  async function inspectTurn(
+    member: Member,
+    pending: Pending,
+    checkState = true,
+  ): Promise<Outcome> {
+    const empty: Transcript = { turns: [], toolNames: [], turnCount: 0, followUpPending: false };
     const transcript = await readTranscript(member.sessionPath).catch(() => empty);
-    if (transcript.turnCount > baseline) return { kind: "done", transcript };
     if (!checkState) return { kind: "pending", state: "unknown" };
 
     const state = await memberState(member);
-    if (state === "blocked") return { kind: "blocked" };
-    return { kind: "pending", state };
+    const resultExists = pending.result
+      ? (await inspectResult(pending.result, process.cwd())).exists
+      : true;
+    const startsInlineSettle =
+      pending.result === undefined &&
+      transcript.turnCount > pending.baseline &&
+      (state === "idle" || state === "done") &&
+      !transcript.followUpPending;
+    const settledAt = startsInlineSettle ? pending.settledAt ?? Date.now() : undefined;
+
+    if (settledAt !== pending.settledAt) {
+      const current = registry.get(member.name);
+      if (isSamePending(current.pending, pending)) {
+        persist({ ...current, pending: { ...current.pending, settledAt } });
+      }
+    }
+
+    const outcome = classifyTaskCompletion({
+      baseline: pending.baseline,
+      turnCount: transcript.turnCount,
+      state,
+      resultExpected: pending.result !== undefined,
+      resultExists,
+      followUpPending: transcript.followUpPending,
+      settledForMs: settledAt === undefined ? undefined : Date.now() - settledAt,
+    });
+    return outcome.kind === "done" ? { kind: "done", transcript } : outcome;
   }
 
   /** Start one session-scoped watcher for a detached member task. */
@@ -784,7 +811,7 @@ export default function (pi: ExtensionAPI) {
       const pending = member.pending;
       if (!pending) return;
 
-      const outcome = await inspectTurn(member, pending.baseline, shouldCheckState(pending, tick));
+      const outcome = await inspectTurn(member, pending, shouldCheckState(pending, tick));
       if (signal.aborted) return;
       const state = notificationState(outcome);
 

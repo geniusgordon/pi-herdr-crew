@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   assertCanDispatch,
+  classifyTaskCompletion,
+  finalizeCollectedTask,
   isLiveObservation,
   isSamePending,
   notificationState,
@@ -51,6 +53,74 @@ test("rolls back a dispatch that Herdr did not accept", () => {
   });
 });
 
+test("keeps a new turn pending while the member works", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({ baseline: 1, turnCount: 2, state: "working", resultExpected: true, resultExists: true }),
+    { kind: "pending", state: "working" },
+  );
+});
+
+test("keeps a settled file task pending without its result", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({ baseline: 1, turnCount: 2, state: "idle", resultExpected: true, resultExists: false }),
+    { kind: "pending", state: "idle" },
+  );
+});
+
+test("keeps a settled inline task pending before its follow-up turn", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({
+      baseline: 1,
+      turnCount: 2,
+      state: "idle",
+      resultExpected: false,
+      resultExists: true,
+      followUpPending: true,
+    }),
+    { kind: "pending", state: "idle" },
+  );
+});
+
+test("keeps a settled inline task pending during its stability window", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({
+      baseline: 1,
+      turnCount: 2,
+      state: "idle",
+      resultExpected: false,
+      resultExists: true,
+      settledForMs: 1_999,
+    }),
+    { kind: "pending", state: "idle" },
+  );
+});
+
+test("completes an inline task after a stable settled state", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({
+      baseline: 1,
+      turnCount: 2,
+      state: "idle",
+      resultExpected: false,
+      resultExists: true,
+      settledForMs: 2_000,
+    }),
+    { kind: "done" },
+  );
+});
+
+test("completes a settled file task with its result", () => {
+  assert.deepEqual(
+    classifyTaskCompletion({ baseline: 1, turnCount: 2, state: "idle", resultExpected: true, resultExists: true }),
+    { kind: "done" },
+  );
+});
+
+test("keeps pending task ownership until collection succeeds", () => {
+  assert.equal(finalizeCollectedTask(member(pending), false).pending, pending);
+  assert.equal(finalizeCollectedTask(member(pending), true).pending, undefined);
+});
+
 test("matches only the task owned by a watcher", () => {
   assert.equal(isSamePending(pending, { taskId: "audit", turn: 2 }), true);
   assert.equal(isSamePending(undefined, { taskId: "audit", turn: 2 }), false);
@@ -65,8 +135,9 @@ test("maps terminal observations to notification states", () => {
   assert.equal(notificationState({ kind: "pending", state: "working" }), undefined);
 });
 
-test("checks state each second during a blocked episode", () => {
+test("checks state each second during blocked and inline-settle episodes", () => {
   assert.equal(shouldCheckState({ ...pending, notifiedState: "blocked" }, 1), true);
+  assert.equal(shouldCheckState({ ...pending, settledAt: 100 }, 1), true);
   assert.equal(shouldCheckState(pending, 1), false);
   assert.equal(shouldCheckState(pending, 5), true);
 });
