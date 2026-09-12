@@ -90,7 +90,7 @@ test("builds Pi arguments from role capabilities", () => {
   const args = buildPiRoleArgs(role, directory);
   assert.deepEqual(args.slice(0, 3), [
     "--tools",
-    "read,grep",
+    "read,grep,crew_submit_result",
     "--append-system-prompt",
   ]);
   assert.match(args[3]!, /\/reviewer-[a-f0-9]{16}\.md$/);

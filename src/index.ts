@@ -17,6 +17,7 @@
  * summary line. Measured on a 12283 byte audit, this context took 124 bytes.
  */
 
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -52,10 +53,10 @@ import {
   findLatestResult,
   inspectResult,
   listTaskFiles,
-  nextTurn,
   readSection,
   renderBrief,
   renderPrompt,
+  reserveTurn,
   taskPaths,
   writeBrief,
   writeIgnore,
@@ -63,8 +64,10 @@ import {
 } from "./protocol.js";
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
 import { buildPiRoleArgs, buildRoleTaskPrompts, discoverRoles, findRole } from "./roles.js";
+import { writeResultCapability } from "./result-capability.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
+const RESULT_TOOL_EXTENSION = new URL("./result-tool.ts", import.meta.url).pathname;
 const START_TIMEOUT_MS = 60_000;
 const SHELL_READY_TIMEOUT_MS = 15_000;
 const OWNERSHIP_ROOT = join(homedir(), ".pi", "agent", "crew", "ownership");
@@ -435,6 +438,8 @@ export default function (pi: ExtensionAPI) {
             trustFlag,
             "--name",
             `member: ${name}`,
+            "--extension",
+            RESULT_TOOL_EXTENSION,
             ...buildPiRoleArgs(role),
           ]
         : [];
@@ -574,10 +579,11 @@ export default function (pi: ExtensionAPI) {
     const taskId = params.task_id ? slugify(params.task_id) : member.task ?? member.name;
     // Disk owns the turn number. A member that returns to an earlier task_id would
     // restart at turn 1 from its own counter and overwrite that task's files.
-    const turn = await nextTurn(ctx.cwd, taskId);
+    const turn = await reserveTurn(ctx.cwd, taskId);
     // The orchestrator cwd owns every brief and result. A worktree member runs in
     // a directory that close removes, so a result stored there dies with it.
     const paths = taskPaths(ctx.cwd, taskId, turn);
+    const resultToken = randomUUID();
     let prompt = task;
 
     if (useFile) {
@@ -591,6 +597,7 @@ export default function (pi: ExtensionAPI) {
           dir: paths.dir,
           memberCwd: member.cwd,
           context: params.context,
+          resultToken: member.kind === "pi" ? resultToken : undefined,
         }),
       );
       prompt = renderPrompt(paths.brief);
@@ -631,7 +638,17 @@ export default function (pi: ExtensionAPI) {
     const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
     const pendingMember = { ...member, task: taskId, turns: turn, lastResult: pending.result, pending };
-    await persistDurably(pendingMember);
+    await flushOwnership(member.name);
+    const setupIdentity = ownershipIdentity(member) as OwnershipIdentity;
+    await ownership.runAndSave(setupIdentity, async () => {
+      await writeResultCapability(member.sessionPath, {
+        resultPath: pending.result ?? null,
+        token: resultToken,
+      });
+      return { result: undefined, member: pendingMember };
+    });
+    registry.put(pendingMember);
+    pi.appendEntry(CREW_ENTRY, pendingMember);
 
     // Dispatch while this session still owns the member. A transfer waits for the prompt attempt.
     try {

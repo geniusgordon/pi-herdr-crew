@@ -14,7 +14,7 @@
  * The same audit then cost the parent a 124 byte reply line, a 99x reduction.
  */
 
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 /** Root that holds one directory per task, relative to the orchestrator cwd. */
@@ -81,6 +81,8 @@ export function renderBrief(options: {
   /** The member's own working directory, for a work product such as a patch. */
   memberCwd: string;
   context?: string;
+  /** Token accepted only by this task's crew_submit_result call. */
+  resultToken?: string;
 }): string {
   const lines = [
     `# Brief: ${options.member}`,
@@ -95,18 +97,36 @@ export function renderBrief(options: {
     lines.push("## Context", "", options.context.trim(), "");
   }
 
+  if (options.resultToken) {
+    lines.push(
+      "## Deliverable",
+      "",
+      "Call `crew_submit_result` once with your complete Markdown answer and this task token:",
+      "",
+      `    ${options.resultToken}`,
+      "",
+      "The tool writes to this task's result file. Do not use another tool to write it.",
+      "Use markdown headings, one section per topic.",
+      "Put every detail in the tool content, because it is the only durable output.",
+      "",
+    );
+  } else {
+    lines.push(
+      "## Deliverable",
+      "",
+      "Write your complete answer to this exact absolute path:",
+      "",
+      `    ${options.result}`,
+      "",
+      "Create the parent directory first if it does not exist.",
+      "That path is outside your working directory. Use it exactly as written.",
+      "Use markdown headings, one section per topic.",
+      "Put every detail in that file, because it is the only durable output.",
+      "",
+    );
+  }
+
   lines.push(
-    "## Deliverable",
-    "",
-    `Write your complete answer to this exact absolute path:`,
-    "",
-    `    ${options.result}`,
-    "",
-    "Create the parent directory first if it does not exist.",
-    "That path is outside your working directory. Use it exactly as written.",
-    "Use markdown headings, one section per topic.",
-    "Put every detail in that file, because it is the only durable output.",
-    "",
     "## Reply",
     "",
     "Reply with one line only. Start it with DONE, then a count or a short verdict.",
@@ -117,7 +137,9 @@ export function renderBrief(options: {
     "1. You cannot see the orchestrator conversation. This brief holds every needed fact.",
     `2. Write a work product, such as a patch or a source file, into \`${options.memberCwd}\`.`,
     `3. Write an extra orchestration artifact, such as a table, into \`${options.dir}\`.`,
-    "4. Report a blocker in the result file, then reply with BLOCKED and the reason.",
+    options.resultToken
+      ? "4. Submit a blocker with `crew_submit_result`, then reply with BLOCKED and the reason."
+      : "4. Report a blocker in the result file, then reply with BLOCKED and the reason.",
     "",
   );
 
@@ -213,6 +235,23 @@ export async function nextTurn(orchestratorCwd: string, task: string): Promise<n
   }
 
   return highest + 1;
+}
+
+export async function reserveTurn(orchestratorCwd: string, task: string): Promise<number> {
+  const dir = join(orchestratorCwd, CREW_ROOT, task);
+  await mkdir(dir, { recursive: true });
+
+  for (;;) {
+    const turn = await nextTurn(orchestratorCwd, task);
+    const suffix = turn > 1 ? `-${turn}` : "";
+    try {
+      const handle = await open(join(dir, `brief${suffix}.md`), "wx", 0o600);
+      await handle.close();
+      return turn;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
 }
 
 /**

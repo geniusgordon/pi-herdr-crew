@@ -114,7 +114,7 @@ export function buildPiRoleArgs(
   }
 
   return [
-    ...(role.tools ? ["--tools", role.tools.join(",")] : []),
+    ...(role.tools ? ["--tools", [...role.tools, "crew_submit_result"].join(",")] : []),
     "--append-system-prompt",
     promptPath,
   ];
