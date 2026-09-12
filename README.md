@@ -94,11 +94,12 @@ pi install /path/to/pi-herdr-crew
 
 ## The `crew` tool
 
-One tool, nine actions.
+One tool, ten actions.
 
 | Action | What it does |
 |---|---|
 | `open` | Create a tab or worktree, start an agent, and dispatch an optional first task |
+| `roles` | List role presets available to `open` |
 | `adopt` | Transfer a live member to this Pi session after confirmation |
 | `ask` | Write a brief and dispatch a task to an open member |
 | `collect` | Return a settled task summary and result shape without waiting |
@@ -141,6 +142,46 @@ crew action=close   member=review-api
 
 Close a member after the final result. Keep it open only for reuse, correction,
 or user takeover. Collect each task before you dispatch the next task.
+
+### Role presets
+
+Put reusable Pi member instructions in a role file:
+
+```text
+~/.pi/agent/agents/reviewer.md       # global
+.pi/agents/reviewer.md               # project, loaded only with trust=true
+```
+
+A trusted project role overrides a global role with the same `name`.
+
+```markdown
+---
+name: worker
+description: Implement one bounded change
+tools: read,bash,edit,write,grep,find,ls
+skills: implement,tdd
+---
+
+Implement the assigned change. Run the relevant checks.
+```
+
+List roles, then open a member with one:
+
+```
+crew action=roles
+crew action=open member=worker-api role=worker task="Implement the API change."
+```
+
+The Markdown body is appended to the Pi system prompt. `tools` is a real Pi
+tool allowlist. `skills` is an ordered, comma-separated list of Pi skills.
+Crew submits each `/skill:<name>` command in order before every task prompt.
+Each skill command uses a separate Pi turn because Herdr accepts one prompt per call.
+The final task still uses `brief.md` as its source of truth.
+Role presets currently support Pi members only.
+Project roles require `trust=true`, like other project-local Pi resources.
+
+The global `reviewer` role does not load `code-review`. That skill starts child
+agents, but the reviewer role keeps a read-only `read,grep,find,ls` allowlist.
 
 ### Read-only member
 ```

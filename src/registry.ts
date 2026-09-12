@@ -21,6 +21,10 @@ export type Member = {
   sessionPath: string;
   cwd: string;
   kind: string;
+  /** Optional preset that supplied the member prompt and capabilities. */
+  role?: string;
+  /** Ordered Pi skills that load before each task prompt. */
+  roleSkills?: string[];
   /** How the member got its terminal. It decides what close must remove. */
   layout?: "tab" | "split" | "worktree";
   /** Set when the member owns a Herdr git worktree. */

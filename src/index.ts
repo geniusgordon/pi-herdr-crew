@@ -62,6 +62,7 @@ import {
   type ResultInfo,
 } from "./protocol.js";
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
+import { buildPiRoleArgs, buildRoleTaskPrompts, discoverRoles, findRole } from "./roles.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const START_TIMEOUT_MS = 60_000;
@@ -317,6 +318,7 @@ export default function (pi: ExtensionAPI) {
       member: string;
       cwd?: string;
       kind?: string;
+      role?: string;
       worktree?: boolean;
       branch?: string;
       base?: string;
@@ -338,14 +340,22 @@ export default function (pi: ExtensionAPI) {
     }
 
     await reconcileName(name, signal);
-    let ownershipRecord = await ownership.reserve({ memberName: name, ownerSessionId });
 
     // The directory the parent asked for. A worktree member then runs somewhere
     // else, so memberCwd below is the value that matters for the file protocol.
     const cwd = params.cwd ? (params.cwd.startsWith("/") ? params.cwd : `${ctx.cwd}/${params.cwd}`) : ctx.cwd;
-    const kind = params.kind ?? "pi";
+    const role = params.role ? findRole(cwd, params.role, params.trust === true) : undefined;
+    const kind = params.kind ?? role?.kind ?? "pi";
     const layout = params.layout ?? "tab";
 
+    if (role?.tools && kind !== "pi") {
+      throw new Error(`Crew role ${JSON.stringify(role.name)} sets tools, which only Pi members support.`);
+    }
+    if (role?.prompt && kind !== "pi") {
+      throw new Error(`Crew role ${JSON.stringify(role.name)} sets a prompt, which only Pi members support.`);
+    }
+
+    let ownershipRecord = await ownership.reserve({ memberName: name, ownerSessionId });
     let memberCwd = cwd;
     let paneId: string | undefined;
     let workspaceId: string | undefined;
@@ -419,7 +429,15 @@ export default function (pi: ExtensionAPI) {
     // member never needs a predictable id. The name shows in the footer and the
     // tab title instead.
       const trustFlag = params.trust ? "--approve" : "--no-approve";
-      const childArgs = kind === "pi" ? ["--", trustFlag, "--name", `member: ${name}`] : [];
+      const childArgs = kind === "pi"
+        ? [
+            "--",
+            trustFlag,
+            "--name",
+            `member: ${name}`,
+            ...buildPiRoleArgs(role),
+          ]
+        : [];
 
       if (!paneId) throw new Error(`Herdr did not create a pane for member ${name}.`);
       const started = await startAgent(name, kind, paneId, childArgs, signal);
@@ -460,7 +478,7 @@ export default function (pi: ExtensionAPI) {
         ownerSessionId: ownershipRecord.ownerSessionId,
         generation: ownershipRecord.generation,
       },
-      paneId, workspaceId, tabId, sessionPath, kind, worktree,
+      paneId, workspaceId, tabId, sessionPath, kind, role: role?.name, roleSkills: role?.skills, worktree,
       cwd: memberCwd,
       layout: params.worktree ? "worktree" : layout,
       openedAt: new Date().toISOString(),
@@ -475,6 +493,8 @@ export default function (pi: ExtensionAPI) {
       `  cwd     ${memberCwd}`,
       `  status  ${status}`,
     ];
+    if (role) lines.push(`  role    ${role.name} (${role.source})`);
+    if (role?.skills) lines.push(`  skills  ${role.skills.join(", ")}`);
     if (worktree) {
       lines.push(`  branch  ${worktree.branch}`, `  path    ${worktree.path}`);
       if (worktree.sourceWorkspaceId) lines.push(`  under   ${worktree.sourceWorkspaceId}`);
@@ -544,8 +564,6 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
-
     // The file protocol is the default. It keeps a large answer out of this
     // context: the member writes markdown to disk and replies with one line.
     // Pass inline true for a short answer where a file costs more than it saves.
@@ -581,6 +599,36 @@ export default function (pi: ExtensionAPI) {
       onUpdate?.(ok(`${member.name} is working...`));
     }
 
+    const taskPrompts = buildRoleTaskPrompts(
+      member.roleSkills ? { skills: member.roleSkills } : undefined,
+      prompt,
+    );
+    const finalPrompt = taskPrompts.pop() as string;
+
+    try {
+      const identity = ownershipIdentity(member) as OwnershipIdentity;
+      await ownership.runIfCurrent(identity, async () => {
+        for (const skillPrompt of taskPrompts) {
+          await herdr(exec, ["agent", "prompt", member.name, skillPrompt, "--wait"], { signal, timeoutMs: 180_000 });
+        }
+      });
+    } catch (error) {
+      if (error instanceof HerdrError && error.code === "agent_blocked") {
+        return ok(
+          [
+            `Member ${member.name} waits at an approval or question dialog. The task prompt was not sent.`,
+            `Ask the user how to answer it, then use action "keys".`,
+            "",
+            "Pane tail:",
+            await tailPane(member.paneId, 30),
+          ].join("\n"),
+          { blocked: true, member: member.name },
+        );
+      }
+      throw error;
+    }
+
+    const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
     const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
     const pendingMember = { ...member, task: taskId, turns: turn, lastResult: pending.result, pending };
     await persistDurably(pendingMember);
@@ -589,7 +637,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const identity = ownershipIdentity(pendingMember) as OwnershipIdentity;
       await ownership.runIfCurrent(identity, () =>
-        herdr(exec, ["agent", "prompt", member.name, prompt], { signal, timeoutMs: 30_000 }),
+        herdr(exec, ["agent", "prompt", member.name, finalPrompt], { signal, timeoutMs: 30_000 }),
       );
     } catch (error) {
       if (error instanceof HerdrError && error.code === "agent_blocked") {
@@ -1195,6 +1243,7 @@ export default function (pi: ExtensionAPI) {
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
       "  open   - create a tab or worktree, start an agent, and dispatch an optional first task\n" +
+      "  roles  - list role presets available to open\n" +
       "  ask     - write a brief and dispatch a task to an open member\n" +
       "  adopt   - explicitly transfer a live member to this Pi session\n" +
       "  collect - return a settled task summary and result shape without waiting\n" +
@@ -1221,12 +1270,12 @@ export default function (pi: ExtensionAPI) {
       "Close a retained member after you collect and inspect its final result. Keep it open only for reuse, correction, or user takeover.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["open", "adopt", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "roles", "adopt", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
         description: "The member operation to run.",
       }),
       member: Type.Optional(
         Type.String({
-          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status. Adopt transfers ownership after confirmation.',
+          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status, roles, and result with task_id. Adopt transfers ownership after confirmation.',
         }),
       ),
       task: Type.Optional(
@@ -1278,7 +1327,17 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
       kind: Type.Optional(
-        Type.String({ description: 'For open: agent kind such as pi, claude, codex, or gemini. Defaults to "pi".' }),
+        Type.String({
+          description:
+            'For open: agent kind such as pi, claude, codex, or gemini. Role presets support Pi only and cannot use another kind. Defaults to "pi".',
+        }),
+      ),
+      role: Type.Optional(
+        Type.String({
+          description:
+            "For open: role preset from ~/.pi/agent/agents/*.md. With trust true, .pi/agents/*.md can override it. " +
+            "The role sets the Pi prompt, tools, and optional Pi kind.",
+        }),
       ),
       worktree: Type.Optional(
         Type.Boolean({
@@ -1290,7 +1349,8 @@ export default function (pi: ExtensionAPI) {
       trust: Type.Optional(
         Type.Boolean({
           description:
-            "For open: load project-local .pi settings and extensions in the member. Defaults to false, which ignores them.",
+            "For open and roles: load project-local .pi settings, extensions, and role overrides. " +
+            "Defaults to false, which ignores them.",
         }),
       ),
       branch: Type.Optional(Type.String({ description: "For open with a worktree: branch name. Defaults to crew/<name>." })),
@@ -1309,15 +1369,26 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // status needs no member. result accepts a task_id alone, because a task
+      // status and roles need no member. result accepts a task_id alone, because a task
       // lives in the orchestrator cwd and outlives the member that ran it.
-      const optional = params.action === "status" || (params.action === "result" && !!params.task_id);
+      const optional = params.action === "status" || params.action === "roles" || (params.action === "result" && !!params.task_id);
       if (!optional && !params.member) throw new Error(`Action "${params.action}" needs a member name.`);
       const name = params.member as string;
 
       switch (params.action) {
         case "open":
           return openMember({ ...params, member: name }, ctx, signal, onUpdate);
+        case "roles": {
+          const catalog = discoverRoles(ctx.cwd, params.trust === true);
+          const lines = catalog.roles.map(
+            (role) => {
+              const skills = role.skills?.length ? ` [skills: ${role.skills.join(", ")}]` : "";
+              return `${role.name} (${role.source})${skills}${role.description ? ` - ${role.description}` : ""}`;
+            },
+          );
+          if (catalog.diagnostics.length) lines.push("", "Invalid roles:", ...catalog.diagnostics);
+          return ok(lines.length ? lines.join("\n") : "No crew roles are available.", catalog);
+        }
         case "adopt":
           return adoptMember({ member: name }, ctx, signal);
         case "ask":
@@ -1348,6 +1419,7 @@ export default function (pi: ExtensionAPI) {
       let content = theme.fg("toolTitle", theme.bold("crew "));
       content += theme.fg("accent", String(args?.action ?? "?"));
       if (args?.member) content += " " + theme.fg("muted", String(args.member));
+      if (args?.role) content += " " + theme.fg("accent", `(${String(args.role)})`);
       if (args?.worktree) content += " " + theme.fg("dim", "[worktree]");
       if (args?.task) {
         const task = String(args.task).replace(/\s+/g, " ");
