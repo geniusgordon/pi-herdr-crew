@@ -39,12 +39,10 @@ import {
 } from "./async-lifecycle.js";
 import {
   HerdrError,
-  callerPane,
   callerWorkspace,
   herdr,
   herdrText,
   inHerdr,
-  pickDirection,
   type Exec,
 } from "./herdr.js";
 import { OwnershipConflictError, OwnershipStore, type OwnershipIdentity, type OwnershipRecord } from "./ownership.js";
@@ -326,7 +324,6 @@ export default function (pi: ExtensionAPI) {
       branch?: string;
       base?: string;
       trust?: boolean;
-      layout?: "tab" | "split";
       task?: string;
       task_id?: string;
       context?: string;
@@ -349,7 +346,6 @@ export default function (pi: ExtensionAPI) {
     const cwd = params.cwd ? (params.cwd.startsWith("/") ? params.cwd : `${ctx.cwd}/${params.cwd}`) : ctx.cwd;
     const role = params.role ? findRole(cwd, params.role, params.trust === true) : undefined;
     const kind = params.kind ?? role?.kind ?? "pi";
-    const layout = params.layout ?? "tab";
 
     if (role?.tools && kind !== "pi") {
       throw new Error(`Crew role ${JSON.stringify(role.name)} sets tools, which only Pi members support.`);
@@ -394,9 +390,7 @@ export default function (pi: ExtensionAPI) {
       // The member runs in the worktree, not in the source checkout. Every brief
       // and result must land where the member can read and write them.
       memberCwd = String(result.root_pane?.foreground_cwd ?? result.worktree.path);
-    } else if (layout === "tab") {
-      // A tab gives the member a full-width terminal in this workspace. A split
-      // shrinks the caller, and a narrow pane truncates every agent UI.
+    } else {
       onUpdate?.(ok(`Creating a tab for member ${name}...`));
       const result = await herdr(
         exec,
@@ -406,18 +400,6 @@ export default function (pi: ExtensionAPI) {
       paneId = result.root_pane.pane_id;
       workspaceId = result.tab.workspace_id;
       tabId = result.tab.tab_id;
-    } else {
-      onUpdate?.(ok(`Splitting a pane for member ${name}...`));
-      const caller = callerPane();
-      const direction = await pickDirection(exec, caller);
-      const result = await herdr(
-        exec,
-        ["pane", "split", "--pane", caller, "--direction", direction, "--cwd", cwd, "--no-focus"],
-        { signal, timeoutMs: 30_000 },
-      );
-      paneId = result.pane.pane_id;
-      workspaceId = result.pane.workspace_id;
-      tabId = result.pane.tab_id;
     }
 
     onUpdate?.(ok(`Starting ${kind} in ${paneId}...`));
@@ -463,7 +445,7 @@ export default function (pi: ExtensionAPI) {
         await herdr(exec, ["worktree", "remove", "--workspace", worktree.workspaceId, "--force"], {
           timeoutMs: 30_000,
         }).catch(() => {});
-      } else if (layout === "tab" && tabId) {
+      } else if (tabId) {
         await herdr(exec, ["tab", "close", tabId], { timeoutMs: 15_000 }).catch(() => {});
       } else if (paneId) {
         await herdr(exec, ["pane", "close", paneId], { timeoutMs: 15_000 }).catch(() => {});
@@ -485,7 +467,6 @@ export default function (pi: ExtensionAPI) {
       },
       paneId, workspaceId, tabId, sessionPath, kind, role: role?.name, roleSkills: role?.skills, worktree,
       cwd: memberCwd,
-      layout: params.worktree ? "worktree" : layout,
       openedAt: new Date().toISOString(),
     };
     persist(member);
@@ -494,7 +475,6 @@ export default function (pi: ExtensionAPI) {
     const lines = [
       `Member ${name} is open.`,
       `  pane    ${paneId}   (workspace ${workspaceId}${tabId ? `, tab ${tabId}` : ""})`,
-      `  layout  ${member.layout}`,
       `  cwd     ${memberCwd}`,
       `  status  ${status}`,
     ];
@@ -1328,12 +1308,6 @@ export default function (pi: ExtensionAPI) {
           description:
             "For open: working directory. Defaults to this session's cwd. " +
             "With worktree true, pass the source Git repository root that owns the branch and worktrees.",
-        }),
-      ),
-      layout: Type.Optional(
-        StringEnum(["tab", "split"] as const, {
-          description:
-            'For open: "tab" gives the member a full-width tab and is the default. "split" shares the caller tab.',
         }),
       ),
       task_id: Type.Optional(

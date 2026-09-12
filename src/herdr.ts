@@ -26,12 +26,6 @@ export function inHerdr(): boolean {
   return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID;
 }
 
-export function callerPane(): string {
-  const pane = process.env.HERDR_PANE_ID;
-  if (!pane) throw new HerdrError("not_in_herdr", "HERDR_PANE_ID is not set", []);
-  return pane;
-}
-
 export function callerWorkspace(): string {
   const workspace = process.env.HERDR_WORKSPACE_ID;
   if (!workspace) throw new HerdrError("not_in_herdr", "HERDR_WORKSPACE_ID is not set", []);
@@ -127,16 +121,4 @@ export async function herdrText(
   }
 
   return res.stdout;
-}
-
-/** Pick the split direction that keeps both panes usable. */
-export async function pickDirection(exec: Exec, paneId: string): Promise<"right" | "down"> {
-  try {
-    const result = await herdr(exec, ["pane", "layout", "--pane", paneId], { timeoutMs: 10_000 });
-    const rect = result?.layout?.panes?.find((p: any) => p.pane_id === paneId)?.rect;
-    const width = Number(rect?.width ?? 0);
-    return width >= 150 ? "right" : "down";
-  } catch {
-    return "down";
-  }
 }

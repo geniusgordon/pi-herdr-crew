@@ -197,9 +197,8 @@ then `ask`. Use `ask` for a second or later task on that member.
 Startup costs a few seconds before dispatch. After dispatch, the tool returns at
 once and the supervisor owns completion detection.
 
-`open` creates a full-width tab, because a split shrinks the caller and a narrow
-pane truncates every agent UI. Pass `layout="split"` for a sibling pane in the
-current tab. Focus stays in the calling pane either way.
+`open` creates a full-width tab, so the caller keeps its current pane size.
+Focus stays in the calling tab.
 
 The tab lands in the workspace that owns the member's repository, not in the
 caller's workspace. A directory with no open workspace uses the caller's
