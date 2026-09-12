@@ -1,4 +1,6 @@
 node_modules
-.pi/
+!.pi/
+.pi/*
+!.pi/crew/
 .DS_Store
 *.log

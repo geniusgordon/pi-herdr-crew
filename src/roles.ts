@@ -93,8 +93,8 @@ function loadDirectory(path: string, source: CrewRole["source"], catalog: Map<st
 export function discoverRoles(cwd: string, includeProject: boolean): RoleCatalog {
   const catalog = new Map<string, CrewRole>();
   const diagnostics: string[] = [];
-  loadDirectory(join(homedir(), ".pi", "agent", "agents"), "global", catalog, diagnostics);
-  if (includeProject) loadDirectory(join(cwd, ".pi", "agents"), "project", catalog, diagnostics);
+  loadDirectory(join(homedir(), ".pi", "agent", "crew", "roles"), "global", catalog, diagnostics);
+  if (includeProject) loadDirectory(join(cwd, ".pi", "crew", "roles"), "project", catalog, diagnostics);
   return { roles: [...catalog.values()].sort((a, b) => a.name.localeCompare(b.name)), diagnostics };
 }
 

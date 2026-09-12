@@ -133,10 +133,10 @@ test("project roles override global roles when trusted", () => {
   const originalHome = process.env.HOME;
   process.env.HOME = root;
   try {
-    mkdirSync(join(root, ".pi", "agent", "agents"), { recursive: true });
-    mkdirSync(join(root, "repo", ".pi", "agents"), { recursive: true });
-    writeFileSync(join(root, ".pi", "agent", "agents", "reviewer.md"), "---\nname: reviewer\n---\nGlobal prompt.\n");
-    writeFileSync(join(root, "repo", ".pi", "agents", "reviewer.md"), "---\nname: reviewer\n---\nProject prompt.\n");
+    mkdirSync(join(root, ".pi", "agent", "crew", "roles"), { recursive: true });
+    mkdirSync(join(root, "repo", ".pi", "crew", "roles"), { recursive: true });
+    writeFileSync(join(root, ".pi", "agent", "crew", "roles", "reviewer.md"), "---\nname: reviewer\n---\nGlobal prompt.\n");
+    writeFileSync(join(root, "repo", ".pi", "crew", "roles", "reviewer.md"), "---\nname: reviewer\n---\nProject prompt.\n");
 
     assert.equal(discoverRoles(join(root, "repo"), false).roles[0]?.prompt, "Global prompt.");
     assert.equal(discoverRoles(join(root, "repo"), true).roles[0]?.prompt, "Project prompt.");

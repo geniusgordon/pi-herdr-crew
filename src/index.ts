@@ -1352,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
       role: Type.Optional(
         Type.String({
           description:
-            "For open: role preset from ~/.pi/agent/agents/*.md. With trust true, .pi/agents/*.md can override it. " +
+            "For open: role preset from ~/.pi/agent/crew/roles/*.md. With trust true, .pi/crew/roles/*.md can override it. " +
             "The role sets the Pi prompt, tools, and optional Pi kind.",
         }),
       ),

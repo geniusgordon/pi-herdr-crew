@@ -148,8 +148,8 @@ or user takeover. Collect each task before you dispatch the next task.
 Put reusable Pi member instructions in a role file:
 
 ```text
-~/.pi/agent/agents/reviewer.md       # global
-.pi/agents/reviewer.md               # project, loaded only with trust=true
+~/.pi/agent/crew/roles/reviewer.md       # global
+.pi/crew/roles/reviewer.md               # project, loaded only with trust=true
 ```
 
 A trusted project role overrides a global role with the same `name`.
@@ -235,8 +235,8 @@ member name:
 crew action=result task_id="error-audit"
 ```
 
-The extension writes `.pi/crew/.gitignore` containing `*` on first use, so these
-files never reach Git.
+The extension writes `.pi/crew/.gitignore` on first use. It ignores task files
+and keeps `.pi/crew/roles/**` available to Git.
 
 The brief fixes the contract: write the answer to the result file, reply with one
 line starting DONE or BLOCKED, and never paste the answer into the reply.
@@ -267,7 +267,7 @@ The extension passes that value, so the member workspace lands beside its parent
 repository rather than at the end of the workspace list. A repository with no
 open workspace has no such id, so the extension falls back to `--cwd`.
 
-A worktree member runs in the worktree, so its `.pi/members` directory lives there
+A worktree member runs in the worktree, so its `.pi/crew` directory lives there
 too, not in the source checkout.
 
 `close` refuses a dirty worktree and keeps the member open, so uncommitted work

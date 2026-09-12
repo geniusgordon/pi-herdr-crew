@@ -164,16 +164,20 @@ export async function writeBrief(path: string, body: string): Promise<void> {
  * line does. Write the rule into the repository instead of relying on a machine
  * setting.
  */
+const CREW_IGNORE = "# Crew orchestration scratch data. Never shared work.\n*\n!roles/\n!roles/**\n";
+const LEGACY_CREW_IGNORE = "# Crew orchestration scratch data. Never shared work.\n*\n";
+
 export async function writeIgnore(orchestratorCwd: string): Promise<void> {
   const path = join(orchestratorCwd, CREW_ROOT, ".gitignore");
   try {
-    await stat(path);
+    const current = await readFile(path, "utf8");
+    if (current === LEGACY_CREW_IGNORE) await writeFile(path, CREW_IGNORE, "utf8");
     return;
   } catch {
     // Absent, so write it once.
   }
   await mkdir(join(orchestratorCwd, CREW_ROOT), { recursive: true });
-  await writeFile(path, "# Crew orchestration scratch data. Never shared work.\n*\n", "utf8");
+  await writeFile(path, CREW_IGNORE, "utf8");
 }
 
 export type ResultInfo = {
@@ -238,6 +242,7 @@ export async function nextTurn(orchestratorCwd: string, task: string): Promise<n
 }
 
 export async function reserveTurn(orchestratorCwd: string, task: string): Promise<number> {
+  if (task === "roles") throw new Error('Task id "roles" is reserved for crew role presets.');
   const dir = join(orchestratorCwd, CREW_ROOT, task);
   await mkdir(dir, { recursive: true });
 
