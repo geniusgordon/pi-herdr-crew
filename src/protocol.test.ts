@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { renderBrief, reserveTurn, writeIgnore } from "./protocol.ts";
+import { markdownPreview, readDisplayMarkdown, readMarkdownDisplay, renderBrief, reserveTurn, writeIgnore } from "./protocol.ts";
 
 const base = {
   member: "reviewer",
@@ -57,6 +57,37 @@ test("reserves distinct turns concurrently", async () => {
   try {
     const turns = await Promise.all([reserveTurn(root, "audit"), reserveTurn(root, "audit")]);
     assert.deepEqual(turns.sort(), [1, 2]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("builds a bounded Markdown preview", () => {
+  assert.equal(
+    markdownPreview("# Title\n\nFirst line\nSecond line\nThird line\nFourth line"),
+    "# Title\nFirst line\nSecond line\nThird line\n... 1 more lines",
+  );
+});
+
+test("reads a durable Markdown display", async () => {
+  const root = await mkdtemp(join(tmpdir(), "crew-display-"));
+  const path = join(root, ".pi", "crew", "audit", "result.md");
+  try {
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, "# Result\n\nComplete answer.\n", "utf8");
+    assert.deepEqual(await readMarkdownDisplay(path, root, "result"), {
+      kind: "result",
+      path: ".pi/crew/audit/result.md",
+      preview: "# Result\nComplete answer.",
+    });
+    assert.equal(readDisplayMarkdown(root, ".pi/crew/audit/result.md"), "# Result\n\nComplete answer.\n");
+    assert.throws(() => readDisplayMarkdown(root, "README.md"), /outside \.pi\/crew/);
+
+    const outside = join(root, "secret.md");
+    const link = join(root, ".pi", "crew", "audit", "linked.md");
+    await writeFile(outside, "secret", "utf8");
+    await symlink(outside, link);
+    assert.throws(() => readDisplayMarkdown(root, ".pi/crew/audit/linked.md"), /not a regular file/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

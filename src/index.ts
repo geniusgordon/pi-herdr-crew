@@ -21,9 +21,9 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 import {
@@ -51,6 +51,8 @@ import {
   findLatestResult,
   inspectResult,
   listTaskFiles,
+  readDisplayMarkdown,
+  readMarkdownDisplay,
   readSection,
   renderBrief,
   renderPrompt,
@@ -58,6 +60,7 @@ import {
   taskPaths,
   writeBrief,
   writeIgnore,
+  type MarkdownDisplay,
   type ResultInfo,
 } from "./protocol.js";
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
@@ -655,6 +658,7 @@ export default function (pi: ExtensionAPI) {
       throw error;
     }
 
+    const display = useFile ? await readMarkdownDisplay(paths.brief, ctx.cwd, "brief") : undefined;
     watchPending(member.name);
     return ok(
       [
@@ -662,7 +666,7 @@ export default function (pi: ExtensionAPI) {
         useFile ? `It writes ${paths.resultRelative}.` : `It answers inline.`,
         `The main agent receives a notification when the task settles.`,
       ].join("\n"),
-      { member: member.name, task: taskId, pending: true },
+      { member: member.name, task: taskId, pending: true, display },
     );
   }
 
@@ -753,6 +757,7 @@ export default function (pi: ExtensionAPI) {
       const files = await listTaskFiles(ctx.cwd, taskId);
       const extras = files.filter((file) => !/^(brief|result)(-\d+)?\.md$/.test(file.name));
 
+      const display = await readMarkdownDisplay(paths.result, ctx.cwd, "result");
       return ok(
         [
           transcript.final?.trim() || "(the member sent no summary line)",
@@ -766,7 +771,7 @@ export default function (pi: ExtensionAPI) {
         ]
           .filter((line) => line !== "")
           .join("\n"),
-        { member: member.name, state, task: taskId, result: info },
+        { member: member.name, state, task: taskId, result: info, display },
       );
     }
 
@@ -825,6 +830,7 @@ export default function (pi: ExtensionAPI) {
       persist({ ...member, lastResult: path });
     }
 
+    const display = await readMarkdownDisplay(path, ctx.cwd, "result");
     const info: ResultInfo = await inspectResult(path, ctx.cwd);
     if (!info.exists) throw new Error(`Result file ${info.relative} does not exist.`);
 
@@ -839,12 +845,12 @@ export default function (pi: ExtensionAPI) {
         ]
           .filter((line) => line !== "")
           .join("\n"),
-        { member: member?.name, task: taskId, result: info },
+        { member: member?.name, task: taskId, result: info, display },
       );
     }
 
     const body = await readSection(path, { section: params.section, maxBytes: params.max_bytes });
-    return ok(body, { member: member?.name, task: taskId, section: params.section });
+    return ok(body, { member: member?.name, task: taskId, section: params.section, display });
   }
 
   /**
@@ -1413,20 +1419,50 @@ export default function (pi: ExtensionAPI) {
       if (args?.role) content += " " + theme.fg("accent", `(${String(args.role)})`);
       if (args?.worktree) content += " " + theme.fg("dim", "[worktree]");
       if (args?.task) {
-        const task = String(args.task).replace(/\s+/g, " ");
-        content += " " + theme.fg("dim", `"${task.length > 60 ? `${task.slice(0, 60)}...` : task}"`);
+        const task = String(args.task);
+        const preview = task.replace(/\s+/g, " ");
+        content += context.expanded
+          ? `\n\n${theme.fg("muted", "Task")}\n${task}`
+          : " " + theme.fg("dim", `"${preview.length > 60 ? `${preview.slice(0, 60)}...` : preview}"`);
+        if (context.expanded && args?.context) {
+          content += `\n\n${theme.fg("muted", "Context")}\n${String(args.context)}`;
+        }
       }
       text.setText(content);
       return text;
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, context) {
       const body = result.content?.map((c: any) => c.text).join("\n") ?? "";
       if (isPartial) return new Text(theme.fg("warning", body || "working..."), 0, 0);
 
-      const details = result.details as { blocked?: boolean; dirty?: boolean } | undefined;
+      const details = result.details as { blocked?: boolean; dirty?: boolean; display?: MarkdownDisplay } | undefined;
       if (details?.blocked || details?.dirty) return new Text(theme.fg("warning", body), 0, 0);
-      if ((result as typeof result & { isError?: boolean }).isError) return new Text(theme.fg("error", body), 0, 0);
+      if (context.isError) return new Text(theme.fg("error", body), 0, 0);
+
+      if (details?.display) {
+        const bodyLines = body.split("\n");
+        const collapsedBody = bodyLines.length <= 8
+          ? body
+          : [...bodyLines.slice(0, 8), theme.fg("dim", `... ${bodyLines.length - 8} more lines`)].join("\n");
+        if (!expanded) {
+          return new Text(
+            `${collapsedBody}\n\n${theme.fg("muted", `${details.display.kind}: ${details.display.path}`)}\n${theme.fg("dim", details.display.preview)}`,
+            0,
+            0,
+          );
+        }
+
+        const container = new Container();
+        if (body) container.addChild(new Text(body, 0, 0));
+        container.addChild(new Text(theme.fg("muted", `${details.display.kind}: ${details.display.path}`), 0, 1));
+        try {
+          container.addChild(new Markdown(readDisplayMarkdown(context.cwd, details.display.path), 0, 0, getMarkdownTheme()));
+        } catch (error) {
+          container.addChild(new Text(theme.fg("error", (error as Error).message), 0, 0));
+        }
+        return container;
+      }
 
       const lines = body.split("\n");
       if (expanded || lines.length <= 8) return new Text(body, 0, 0);

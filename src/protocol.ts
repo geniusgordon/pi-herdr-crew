@@ -14,6 +14,7 @@
  * The same audit then cost the parent a 124 byte reply line, a 99x reduction.
  */
 
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -178,6 +179,61 @@ export async function writeIgnore(orchestratorCwd: string): Promise<void> {
   }
   await mkdir(join(orchestratorCwd, CREW_ROOT), { recursive: true });
   await writeFile(path, CREW_IGNORE, "utf8");
+}
+
+export type MarkdownDisplay = {
+  kind: "brief" | "result";
+  path: string;
+  preview: string;
+};
+
+/** Build a small plain-text preview from meaningful Markdown lines. */
+export function markdownPreview(markdown: string, maxLines = 4, maxChars = 600): string {
+  const lines = markdown
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const shown = lines.slice(0, maxLines);
+  const preview = shown.join("\n");
+
+  if (preview.length > maxChars) return `${preview.slice(0, maxChars).trimEnd()}...`;
+  if (lines.length > shown.length) return `${preview}\n... ${lines.length - shown.length} more lines`;
+  return preview;
+}
+
+/** Read bounded display metadata without persisting the full Markdown in the Pi session. */
+export async function readMarkdownDisplay(
+  path: string,
+  orchestratorCwd: string,
+  kind: MarkdownDisplay["kind"],
+): Promise<MarkdownDisplay> {
+  const markdown = readDisplayMarkdown(orchestratorCwd, path);
+  return {
+    kind,
+    path: isAbsolute(path) ? relative(orchestratorCwd, path) : path,
+    preview: markdownPreview(markdown),
+  };
+}
+
+/** Read display Markdown only from the crew scratch directory. */
+export function readDisplayMarkdown(orchestratorCwd: string, path: string): string {
+  const root = resolve(orchestratorCwd, CREW_ROOT);
+  const absolute = resolve(orchestratorCwd, path);
+  if (absolute !== root && !absolute.startsWith(`${root}/`)) {
+    throw new Error(`Crew display path is outside ${CREW_ROOT}: ${path}`);
+  }
+
+  const stats = lstatSync(absolute);
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(`Crew display path is not a regular file: ${path}`);
+  }
+
+  const canonicalRoot = realpathSync(root);
+  const canonical = realpathSync(absolute);
+  if (!canonical.startsWith(`${canonicalRoot}/`)) {
+    throw new Error(`Crew display path resolves outside ${CREW_ROOT}: ${path}`);
+  }
+  return readFileSync(canonical, "utf8");
 }
 
 export type ResultInfo = {
