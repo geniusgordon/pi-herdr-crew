@@ -66,11 +66,13 @@ import {
 import { CREW_ENTRY, MemberRegistry, assertMemberName, type Member, type Pending } from "./registry.js";
 import { buildPiRoleArgs, buildRoleTaskPrompts, discoverRoles, findRole } from "./roles.js";
 import { writeResultCapability } from "./result-capability.js";
+import { waitForAgentSession } from "./session-readiness.js";
 import { formatTrace, readTranscript, type Transcript } from "./transcript.js";
 
 const RESULT_TOOL_EXTENSION = new URL("./result-tool.ts", import.meta.url).pathname;
 const START_TIMEOUT_MS = 60_000;
 const SHELL_READY_TIMEOUT_MS = 15_000;
+const SESSION_READY_TIMEOUT_MS = 120_000;
 const OWNERSHIP_ROOT = join(homedir(), ".pi", "agent", "crew", "ownership");
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean };
@@ -431,16 +433,28 @@ export default function (pi: ExtensionAPI) {
 
       if (!paneId) throw new Error(`Herdr did not create a pane for member ${name}.`);
       const started = await startAgent(name, kind, paneId, childArgs, signal);
+      const agent = await waitForAgentSession(
+        started.agent,
+        async (remainingMs) => (
+          await herdr(exec, ["agent", "get", name], { signal, timeoutMs: Math.min(10_000, remainingMs) })
+        ).agent,
+        {
+          timeoutMs: SESSION_READY_TIMEOUT_MS,
+          pollMs: 500,
+          signal,
+          shouldRetry: (error) => error instanceof HerdrError && ["timeout", "herdr_failed", "bad_response"].includes(error.code),
+        },
+      );
 
-      const reported = started.agent?.agent_session?.value;
+      const reported = agent?.agent_session?.value;
       if (typeof reported !== "string" || !reported.startsWith("/")) {
         throw new Error(
-          `Herdr started ${kind} in ${paneId} but reported no session file, so a clean read is impossible. ` +
-            `The agent usually waits at a startup dialog. Pane tail:\n${await tailPane(paneId, 20)}`,
+          `Herdr started ${kind} in ${paneId}, but Pi did not report a session file within ${SESSION_READY_TIMEOUT_MS / 1_000} seconds. ` +
+            `Complete any startup dialog and try again. Pane tail:\n${await tailPane(paneId, 20)}`,
         );
       }
       sessionPath = reported;
-      status = String(started.agent?.agent_status ?? "unknown");
+      status = String(agent?.agent_status ?? "unknown");
       ownershipRecord = await ownership.activate(ownershipRecord, { paneId, sessionPath });
     } catch (error) {
       // Never leave an orphan pane. It also deadlocks the member name.
