@@ -94,10 +94,12 @@ pi install /path/to/pi-herdr-crew
 
 ## The `crew` tool
 
-One tool, ten actions.
+One tool, twelve actions.
 
 | Action | What it does |
 |---|---|
+| `batch` | Declare the fixed required members before dispatch; return a batch ID |
+| `batch_cancel` | Cancel the barrier without closing its children |
 | `open` | Create a tab or worktree, start an agent, and dispatch an optional first task |
 | `roles` | List role presets available to `open` |
 | `adopt` | Transfer a live member to this Pi session after confirmation |
@@ -126,6 +128,52 @@ blocks, or loses its pane. The message wakes an idle main agent.
 
 `collect` never waits. Call it after the completion notification. It validates
 the result, returns its bounded shape, and clears the pending task.
+
+### Parallel research, one answer
+
+Declare every required member before dispatch. Pass the returned `batch_id` to
+those tasks:
+
+```text
+crew action=batch expected_members=["api","tests"]
+crew action=open member=api batch_id=<returned-id> task="Audit the API."
+crew action=open member=tests batch_id=<returned-id> task="Audit the tests."
+# Yield. One aggregate settled event identifies completed and failed tasks.
+crew action=collect member=api
+crew action=collect member=tests
+```
+
+Individual grouped completions do not wake the parent. Blocked or lost members
+still request attention. When every required slot terminates, the batch sends
+one completion event. `all_done` means every task technically completed, not
+that every research result reports success. The parent reads the result sections
+and delivers one combined answer.
+
+A batch has one task per member. A task must use its declared member name.
+Ungrouped tasks retain their individual notifications. `Promise.all` of `open`
+calls waits for dispatch, not member completion.
+
+Use `crew action=status batch_id=<id>` for recovery or requested progress.
+It shows awaiting dispatch, interrupted preparation, uncertain dispatch, and
+terminal outcomes. It is not a polling instruction. Resume undispatched slots
+or cancel the barrier explicitly:
+
+```text
+crew action=batch_cancel batch_id=<id>
+```
+
+Cancellation keeps children and result files intact. Ordinary child notifications
+resume, including results that completed silently before cancellation. A settled
+batch notification already submitted to Pi cannot be withdrawn.
+
+Batch state follows the active parent branch and survives reload. A child
+transferred to another parent leaves the original batch with an ownership-loss
+outcome. Normal execution submits one aggregate event. Crash recovery can repeat
+an event whose queued delivery did not reach the session log; event IDs remain
+stable. Exactly-once delivery across process crashes is not guaranteed.
+
+The tool description contains the API and collection instructions. A global
+`AGENTS.md` rule can specify combined answer delivery without duplicating the API.
 
 ### Reusable member
 

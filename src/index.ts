@@ -37,6 +37,7 @@ import {
   rollbackDispatch,
   shouldCheckState,
 } from "./async-lifecycle.js";
+import { CompletionBarriers, BATCH_ENTRY, type TaskBinding } from "./completion-barrier.js";
 import {
   HerdrError,
   callerWorkspace,
@@ -97,12 +98,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, ownershipRoot = OWNERSHIP_ROOT) {
   const registry = new MemberRegistry();
-  const ownership = new OwnershipStore(OWNERSHIP_ROOT);
+  const ownership = new OwnershipStore(ownershipRoot);
   const watchers = new Map<string, AbortController>();
   const ownershipWrites = new Map<string, Promise<void>>();
+  const dispatches = new Map<string, Promise<unknown>>();
   let ownerSessionId = "";
+  let lifecycleEpoch = 0;
+  const batches = new CompletionBarriers({
+    persist: (batch) => pi.appendEntry(BATCH_ENTRY, batch),
+    attention: (batch, name) => pi.sendMessage({ customType: "herdr-crew-event",
+      content: `Crew batch ${batch.id}: member ${name} is ${batch.slots[name]!.state}. Inspect the failed task; other slots can still be pending.`,
+      display: true, details: { batchId: batch.id, member: name, state: batch.slots[name]!.state },
+    }, { deliverAs: "followUp", triggerTurn: true }),
+    notify: (batch) => pi.sendMessage({
+      customType: "herdr-crew-batch",
+      content: `Crew batch ${batch.id} settled. all_done=${batch.allDone}.\n` +
+        Object.entries(batch.slots).map(([name, slot]) => `${name}: ${slot.state}` +
+          (slot.binding ? ` (task ${slot.binding.taskId}, turn ${slot.binding.turn})` : "")).join("\n") +
+        "\nCollect done members, read the required sections, and deliver one combined answer. Report failed slots explicitly.",
+      display: true,
+      details: { batchId: batch.id, eventId: batch.eventId, allDone: batch.allDone, slots: batch.slots },
+    }, { deliverAs: "followUp", triggerTurn: true }),
+  });
   const exec: Exec = (command, args, options) => pi.exec(command, args, options);
 
   // ---------------------------------------------------------------- lifecycle
@@ -112,22 +131,39 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("herdr-crew", undefined);
       return;
     }
+    stopWatchers();
     ownerSessionId = ctx.sessionManager.getSessionId();
     registry.restore(ctx.sessionManager.getEntries());
+    batches.restore(ctx.sessionManager.getBranch(), ownerSessionId, true);
     for (const member of registry.openMembers()) {
       const identity = ownershipIdentity(member);
       if (!identity || !(await ownership.isCurrent(identity))) registry.discard(member.name);
     }
     await adoptMembers();
+    await reconcileBatches();
+    batches.resumeNotifications();
     refreshStatus(ctx);
     for (const member of registry.openMembers()) {
       if (member.pending) watchPending(member.name);
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  function stopWatchers(): void {
+    lifecycleEpoch += 1;
     for (const controller of watchers.values()) controller.abort();
     watchers.clear();
+  }
+
+  pi.on("session_tree", async (_event, ctx) => {
+    stopWatchers();
+    batches.restore(ctx.sessionManager.getBranch(), ownerSessionId);
+    await reconcileBatches();
+    batches.resumeNotifications();
+    for (const member of registry.openMembers()) if (member.pending) watchPending(member.name);
+  });
+
+  pi.on("session_shutdown", async () => {
+    stopWatchers();
     await Promise.allSettled(ownershipWrites.values());
     ownershipWrites.clear();
   });
@@ -185,12 +221,99 @@ export default function (pi: ExtensionAPI) {
     return record.ownerSessionId === ownerSessionId;
   }
 
+  function taskBinding(member: Member, pending: Pending): TaskBinding {
+    const identity = ownershipIdentity(member);
+    if (!identity) throw new Error(`Member ${member.name} has no ownership identity.`);
+    return { ...identity, taskId: pending.taskId, turn: pending.turn };
+  }
+
+  function recordCollectedCompletion(member: Member, pending: Pending): void {
+    if (pending.batchId && batches.active(pending.batchId)) {
+      batches.observe(pending.batchId, taskBinding(member, pending), "done");
+    }
+  }
+
+  async function reconcileBatches(): Promise<void> {
+    for (const batch of batches.list()) {
+      if (batch.cancelled) continue;
+      for (const [name, slot] of Object.entries(batch.slots)) {
+        if (slot.state === "preparing") {
+          // Preparation did not bind a task; expose the interruption through status.
+          continue;
+        }
+        if (!slot.binding || !["running", "dispatch-uncertain"].includes(slot.state)) continue;
+        const binding = slot.binding;
+        if (!(await ownership.isCurrent(binding))) {
+          batches.observe(batch.id, binding, "ownership-lost");
+          continue;
+        }
+        const member = registry.openMembers().find((item) => item.name === name);
+        if (!member) { batches.observe(batch.id, binding, "closed"); continue; }
+        if (member.pending && isSamePending(member.pending, binding)) {
+          const outcome = await inspectTurn(member, member.pending);
+          if (outcome.kind === "done") batches.observe(batch.id, binding, "done");
+          else if (outcome.kind === "pending" && outcome.state === "gone") batches.observe(batch.id, binding, "gone");
+        } else if (member.task === binding.taskId && member.turns === binding.turn && !member.pending) {
+          batches.observe(batch.id, binding, "done");
+        } else {
+          batches.observe(batch.id, binding, "ownership-lost");
+        }
+      }
+    }
+  }
+
+  async function cancelBatch(id: string): Promise<ToolResult> {
+    const batch = batches.get(id, ownerSessionId);
+    if (batch.submitted) return ok(`Batch ${id} already settled; its submitted notification cannot be cancelled.`, { batchId: id });
+    batches.cancel(id, ownerSessionId);
+    for (const member of registry.openMembers()) {
+      if (member.pending?.batchId !== id) continue;
+      watchers.get(member.name)?.abort();
+      watchers.delete(member.name);
+      await persistDurably({ ...member, pending: { ...member.pending, batchId: undefined, notifiedState: undefined } });
+      watchPending(member.name);
+    }
+    return ok(`Batch ${id} cancelled. Children remain open; ordinary completion notifications resume.`, { batchId: id });
+  }
+
+  function batchStatus(id: string): ToolResult {
+    const batch = batches.get(id, ownerSessionId);
+    return ok([`Batch ${id}${batch.cancelled ? " (cancelled)" : ""}:`,
+      ...Object.entries(batch.slots).map(([name, slot]) => `${name}: ${slot.state}`),
+    ].join("\n"), { batch });
+  }
+
+  async function dispatchMember(
+    name: string, batchId: string | undefined, task: string | undefined,
+    operation: (epoch: number) => Promise<ToolResult>,
+  ): Promise<ToolResult> {
+    if (dispatches.has(name)) throw new Error(`Member ${name} already has a dispatch in progress.`);
+    if (batchId && !task?.trim()) throw new Error("A batched dispatch needs a task.");
+    if (batchId) batches.claim(batchId, name, ownerSessionId);
+    const epoch = lifecycleEpoch;
+    const dispatch = Promise.resolve().then(() => operation(epoch));
+    dispatches.set(name, dispatch);
+    try {
+      const result = await dispatch;
+      if (batchId && epoch === lifecycleEpoch) batches.failDispatch(batchId, name);
+      return result;
+    } catch (error) {
+      if (batchId && epoch === lifecycleEpoch) batches.failDispatch(batchId, name);
+      throw error;
+    } finally {
+      if (dispatches.get(name) === dispatch) dispatches.delete(name);
+    }
+  }
+
   // ------------------------------------------------------------------ actions
 
   async function memberFromAgent(agent: any, record: OwnershipRecord, signal?: AbortSignal): Promise<Member> {
     const saved = record.member && typeof record.member === "object" ? record.member as Partial<Member> : undefined;
+    const pending = saved?.pending && { ...saved.pending,
+      batchId: saved.ownership?.ownerSessionId === ownerSessionId ? saved.pending.batchId : undefined };
     const member: Member = {
       ...saved,
+      pending,
       name: record.memberName,
       ownership: {
         memberId: record.memberId,
@@ -333,6 +456,8 @@ export default function (pi: ExtensionAPI) {
       task_id?: string;
       context?: string;
       inline?: boolean;
+      batch_id?: string;
+      epoch?: number;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
@@ -514,6 +639,8 @@ export default function (pi: ExtensionAPI) {
           task_id: params.task_id,
           context: params.context,
           inline: params.inline,
+          batch_id: params.batch_id,
+          epoch: params.epoch,
         },
         ctx,
         signal,
@@ -540,12 +667,18 @@ export default function (pi: ExtensionAPI) {
       task_id?: string;
       inline?: boolean;
       context?: string;
+      batch_id?: string;
+      epoch?: number;
     },
     ctx: ExtensionContext,
     signal?: AbortSignal,
     onUpdate?: (result: ToolResult) => void,
   ): Promise<ToolResult> {
     const member = await resolveMember(params.member, signal);
+    const assertActiveDispatch = () => {
+      if (params.epoch !== undefined && params.epoch !== lifecycleEpoch) throw new Error("The dispatch batch is no longer on the active branch.");
+    };
+    assertActiveDispatch();
     assertCanDispatch(member);
     const task = params.task?.trim();
     if (!task) throw new Error(`Action "ask" needs a task. Pass the full instruction; the member cannot see this session.`);
@@ -613,6 +746,7 @@ export default function (pi: ExtensionAPI) {
       const identity = ownershipIdentity(member) as OwnershipIdentity;
       await ownership.runIfCurrent(identity, async () => {
         for (const skillPrompt of taskPrompts) {
+          assertActiveDispatch();
           await herdr(exec, ["agent", "prompt", member.name, skillPrompt, "--wait"], { signal, timeoutMs: 180_000 });
         }
       });
@@ -633,28 +767,44 @@ export default function (pi: ExtensionAPI) {
     }
 
     const baseline = (await readTranscript(member.sessionPath).catch(() => undefined))?.turnCount ?? 0;
-    const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now() };
+    if (params.batch_id && !batches.has(params.batch_id)) throw new Error("The dispatch batch is no longer on the active branch.");
+    const groupedBatch = params.batch_id && batches.active(params.batch_id) ? params.batch_id : undefined;
+    const pending: Pending = { taskId, turn, baseline, result: useFile ? paths.result : undefined, sentAt: Date.now(), batchId: groupedBatch };
     const pendingMember = { ...member, task: taskId, turns: turn, lastResult: pending.result, pending };
     await flushOwnership(member.name);
     const setupIdentity = ownershipIdentity(member) as OwnershipIdentity;
     await ownership.runAndSave(setupIdentity, async () => {
+      assertActiveDispatch();
       await writeResultCapability(member.sessionPath, {
         resultPath: pending.result ?? null,
         token: resultToken,
       });
       return { result: undefined, member: pendingMember };
     });
-    registry.put(pendingMember);
-    pi.appendEntry(CREW_ENTRY, pendingMember);
+    assertActiveDispatch();
+    if (params.batch_id && !batches.has(params.batch_id)) throw new Error("The dispatch batch is no longer on the active branch.");
+    const boundPending = { ...pending, batchId: pending.batchId && batches.active(pending.batchId) ? pending.batchId : undefined };
+    const boundMember = { ...pendingMember, pending: boundPending };
+    if (boundPending.batchId) batches.bind(boundPending.batchId, taskBinding(boundMember, boundPending));
+    registry.put(boundMember);
+    pi.appendEntry(CREW_ENTRY, boundMember);
 
     // Dispatch while this session still owns the member. A transfer waits for the prompt attempt.
     try {
       const identity = ownershipIdentity(pendingMember) as OwnershipIdentity;
-      await ownership.runIfCurrent(identity, () =>
-        herdr(exec, ["agent", "prompt", member.name, finalPrompt], { signal, timeoutMs: 30_000 }),
-      );
+      await ownership.runIfCurrent(identity, () => {
+        assertActiveDispatch();
+        return herdr(exec, ["agent", "prompt", member.name, finalPrompt], { signal, timeoutMs: 30_000 });
+      });
     } catch (error) {
+      if (params.epoch !== undefined && params.epoch !== lifecycleEpoch) throw error;
+      if (error instanceof HerdrError && error.code === "cli_usage") {
+        if (boundPending.batchId) batches.observe(boundPending.batchId, taskBinding(boundMember, boundPending), "dispatch-failed");
+        await persistDurably(rollbackDispatch(member, boundPending));
+        throw error;
+      }
       if (error instanceof HerdrError && error.code === "agent_blocked") {
+        if (pending.batchId) batches.observe(pending.batchId, taskBinding(pendingMember, pending), "dispatch-failed");
         await persistDurably(rollbackDispatch(member, pending));
         const tail = await tailPane(member.paneId, 30);
         return ok(
@@ -668,17 +818,21 @@ export default function (pi: ExtensionAPI) {
           { blocked: true, member: member.name },
         );
       }
+      if (pending.batchId) batches.observe(pending.batchId, taskBinding(pendingMember, pending), "dispatch-uncertain");
       watchPending(member.name);
       throw error;
     }
 
+    assertActiveDispatch();
     const display = useFile ? await readMarkdownDisplay(paths.brief, ctx.cwd, "brief") : undefined;
+    assertActiveDispatch();
     watchPending(member.name);
     return ok(
       [
         `Member ${member.name} started task ${taskId}.`,
         useFile ? `It writes ${paths.resultRelative}.` : `It answers inline.`,
-        `The main agent receives a notification when the task settles.`,
+        pending.batchId ? `Completion belongs to batch ${pending.batchId}; only the aggregate completion wakes the parent.` :
+          `The main agent receives a notification when the task settles.`,
       ].join("\n"),
       { member: member.name, task: taskId, pending: true, display },
     );
@@ -691,6 +845,9 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal,
   ): Promise<ToolResult> {
     const member = await resolveMember(params.member, signal);
+    if (member.pending?.batchId && !batches.has(member.pending.batchId)) {
+      throw new Error(`Task ${member.pending.taskId} belongs to a batch on another branch. Return to that branch before collection.`);
+    }
     const pending = member.pending;
     if (!pending) {
       throw new Error(`Member ${member.name} has no task in flight. Use action "ask" first.`);
@@ -765,6 +922,8 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
+      const identity = ownershipIdentity(member) as OwnershipIdentity;
+      await ownership.runIfCurrent(identity, () => recordCollectedCompletion(member, pending));
       persist(finalizeCollectedTask(member, true));
       refreshStatus(ctx);
 
@@ -789,6 +948,8 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
+    const identity = ownershipIdentity(member) as OwnershipIdentity;
+    await ownership.runIfCurrent(identity, () => recordCollectedCompletion(member, pending));
     persist(finalizeCollectedTask(member, true));
     refreshStatus(ctx);
 
@@ -955,25 +1116,48 @@ export default function (pi: ExtensionAPI) {
     if (!ownershipIdentity(member)) return;
 
     const controller = new AbortController();
+    const epoch = lifecycleEpoch;
     watchers.set(memberName, controller);
-    void supervisePending(memberName, controller.signal)
+    void supervisePending(memberName, controller.signal, epoch)
       .catch((error) => console.error(`Crew watcher failed for ${memberName}:`, error))
       .finally(() => releaseWatcher(watchers, memberName, controller));
   }
 
   /** Notify the parent once when a detached task finishes or needs attention. */
-  async function supervisePending(memberName: string, signal: AbortSignal): Promise<void> {
+  async function supervisePending(memberName: string, signal: AbortSignal, epoch: number): Promise<void> {
     let tick = 0;
     while (!signal.aborted) {
       const member = registry.get(memberName);
       const identity = ownershipIdentity(member);
-      if (!identity || !(await ownership.isCurrent(identity))) return;
+      if (!identity || !(await ownership.isCurrent(identity))) {
+        if (!signal.aborted && epoch === lifecycleEpoch && member.pending?.batchId) {
+          batches.observe(member.pending.batchId, taskBinding(member, member.pending), "ownership-lost");
+        }
+        return;
+      }
       const pending = member.pending;
       if (!pending) return;
 
       const outcome = await inspectTurn(member, pending, shouldCheckState(pending, tick));
-      if (signal.aborted) return;
+      if (pending.batchId && !batches.has(pending.batchId)) return;
+      if (signal.aborted || epoch !== lifecycleEpoch) return;
       const state = notificationState(outcome);
+
+      if (state === "done" && pending.batchId && batches.active(pending.batchId)) {
+        try {
+          await ownership.runIfCurrent(identity, () => {
+            if (!signal.aborted && epoch === lifecycleEpoch) batches.observe(pending.batchId!, taskBinding(member, pending), "done");
+          });
+        } catch (error) {
+          if (!(error instanceof OwnershipConflictError)) throw error;
+          if (!signal.aborted && epoch === lifecycleEpoch) batches.observe(pending.batchId, taskBinding(member, pending), "ownership-lost");
+        }
+        return;
+      }
+      if (state === "gone" && pending.batchId && batches.active(pending.batchId)) {
+        batches.observe(pending.batchId, taskBinding(member, pending), "gone");
+        return;
+      }
 
       if (state) {
         if (pending.notifiedState !== state) {
@@ -988,6 +1172,7 @@ export default function (pi: ExtensionAPI) {
           try {
             const updatedMember = { ...current, pending: { ...current.pending, notifiedState: state } } as Member;
             await ownership.runAndSave(identity, () => {
+              if (signal.aborted || epoch !== lifecycleEpoch) return { result: undefined, member: current };
               pi.sendMessage(
                 {
                   customType: "herdr-crew-event",
@@ -1033,9 +1218,9 @@ export default function (pi: ExtensionAPI) {
   async function memberState(member: Member): Promise<string> {
     try {
       const result = await herdr(exec, ["agent", "get", member.name], { timeoutMs: 10_000 });
-      return String(result.agent?.agent_status ?? "unknown");
+      return result.agent ? String(result.agent.agent_status ?? "unknown") : "gone";
     } catch {
-      return "gone";
+      return "unknown";
     }
   }
 
@@ -1130,6 +1315,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function statusCrew(ctx: ExtensionContext, signal?: AbortSignal): Promise<ToolResult> {
+    await reconcileBatches();
     for (const member of registry.openMembers()) {
       const identity = ownershipIdentity(member);
       if (!identity || !(await ownership.isCurrent(identity))) registry.discard(member.name);
@@ -1239,6 +1425,7 @@ export default function (pi: ExtensionAPI) {
 
     const wasGone = notes[0] === "__gone__";
     if (wasGone) notes.shift();
+    if (member.pending?.batchId) batches.observe(member.pending.batchId, taskBinding(member, member.pending), "closed");
     registry.markClosed(member.name);
     watchers.get(member.name)?.abort();
     watchers.delete(member.name);
@@ -1260,6 +1447,8 @@ export default function (pi: ExtensionAPI) {
       "file and replies with one summary line, so a large answer never enters this context.\n" +
       "Actions:\n" +
       "  open   - create a tab or worktree, start an agent, and dispatch an optional first task\n" +
+      "  batch - declare the fixed expected_members before dispatch; returns batch_id immediately\n" +
+      "  batch_cancel - cancel the barrier, not its children; restore individual notifications\n" +
       "  roles  - list role presets available to open\n" +
       "  ask     - write a brief and dispatch a task to an open member\n" +
       "  adopt   - explicitly transfer a live member to this Pi session\n" +
@@ -1269,13 +1458,19 @@ export default function (pi: ExtensionAPI) {
       "  trace  - the member's tool calls and messages in order, for a member that answered badly\n" +
       "  keys   - send logical keys such as esc or ctrl+c to a blocked member\n" +
       "  close  - close the pane, or remove the worktree\n" +
-      "A member cannot see this conversation. Put every needed fact in the task text.",
+      "For parallel tasks required by one answer, create a batch first, then pass its batch_id to each open or ask. " +
+      "Grouped successful completions do not wake the parent individually. The batch settled event lists completed and failed slots. " +
+      "Blocked or lost tasks still request attention immediately. A member cannot see this conversation. Put every needed fact in the task text.",
     promptSnippet: "Run pi subagents in visible Herdr panes that answer through markdown files",
     promptGuidelines: [
       "Use crew with action open to create a member and dispatch its first task.",
       "Use crew action adopt only for explicit recovery of a live member owned by another Pi session.",
       "Use crew action ask only for a second or later task on an open member.",
       "Crew open and ask return after dispatch. Wait for the completion notification before collect.",
+      "For parallel tasks required by one answer, create action batch with all expected_members before dispatch; pass batch_id to each open or ask.",
+      "A batch settled event is an internal collection signal: collect done members, read required sections, and deliver one combined answer.",
+      "Blocked, lost, or failed slots require attention; never present them as successful research. Use batch_cancel to abandon a barrier without closing children.",
+      "Use status with batch_id for recovery or requested progress only, not as a polling loop.",
       "Use crew with worktree true when two or more members write files, because one directory tolerates one writer only.",
       "For worktree open, set cwd to the source Git repository root. Do not use a workspace root, a symlinked checkout, or the current feature worktree.",
       "Pass a task_id to crew action ask when one member runs several tasks, because each task_id gets its own directory.",
@@ -1287,12 +1482,14 @@ export default function (pi: ExtensionAPI) {
       "Close a retained member after you collect and inspect its final result. Keep it open only for reuse, correction, or user takeover.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["open", "roles", "adopt", "ask", "collect", "result", "status", "trace", "keys", "close"] as const, {
+      action: StringEnum(["open", "roles", "adopt", "ask", "collect", "result", "status", "trace", "keys", "close", "batch", "batch_cancel"] as const, {
         description: "The member operation to run.",
       }),
+      batch_id: Type.Optional(Type.String({ description: "For open/ask: enroll the task in a predeclared batch. For status/batch_cancel: identify that batch." })),
+      expected_members: Type.Optional(Type.Array(Type.String(), { description: "For batch: nonempty, duplicate-free fixed list of required member names. Declare before any dispatch." })),
       member: Type.Optional(
         Type.String({
-          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for status, roles, and result with task_id. Adopt transfers ownership after confirmation.',
+          description: 'Member name, matching [a-z][a-z0-9_-]{0,31}, for example "review-api". Required except for batch, batch_cancel, status, roles, and result with task_id. Adopt transfers ownership after confirmation.',
         }),
       ),
       task: Type.Optional(
@@ -1382,13 +1579,20 @@ export default function (pi: ExtensionAPI) {
 
       // status and roles need no member. result accepts a task_id alone, because a task
       // lives in the orchestrator cwd and outlives the member that ran it.
-      const optional = params.action === "status" || params.action === "roles" || (params.action === "result" && !!params.task_id);
+      const optional = params.action === "batch" || params.action === "batch_cancel" || params.action === "status" || params.action === "roles" || (params.action === "result" && !!params.task_id);
       if (!optional && !params.member) throw new Error(`Action "${params.action}" needs a member name.`);
       const name = params.member as string;
 
       switch (params.action) {
+        case "batch": {
+          const batch = batches.create(params.expected_members ?? [], ownerSessionId, ctx.cwd);
+          return ok(`Batch ${batch.id} declared for ${Object.keys(batch.slots).join(", ")}. Pass batch_id to each required dispatch.`, { batchId: batch.id, batch });
+        }
+        case "batch_cancel":
+          if (!params.batch_id) throw new Error('Action "batch_cancel" needs batch_id.');
+          return cancelBatch(params.batch_id);
         case "open":
-          return openMember({ ...params, member: name }, ctx, signal, onUpdate);
+          return dispatchMember(name, params.batch_id, params.task, (epoch) => openMember({ ...params, member: name, epoch }, ctx, signal, onUpdate));
         case "roles": {
           const catalog = discoverRoles(ctx.cwd, params.trust === true);
           const lines = catalog.roles.map(
@@ -1403,7 +1607,7 @@ export default function (pi: ExtensionAPI) {
         case "adopt":
           return adoptMember({ member: name }, ctx, signal);
         case "ask":
-          return askMember({ ...params, member: name }, ctx, signal, onUpdate);
+          return dispatchMember(name, params.batch_id, params.task, (epoch) => askMember({ ...params, member: name, epoch }, ctx, signal, onUpdate));
         case "collect":
           return collectMember({ member: name }, ctx, signal);
         case "result":
@@ -1413,6 +1617,7 @@ export default function (pi: ExtensionAPI) {
             signal,
           );
         case "status":
+          if (params.batch_id) { await reconcileBatches(); return batchStatus(params.batch_id); }
           return statusCrew(ctx, signal);
         case "trace":
           return traceMember({ member: name, lines: params.lines }, signal);
@@ -1430,6 +1635,8 @@ export default function (pi: ExtensionAPI) {
       let content = theme.fg("toolTitle", theme.bold("crew "));
       content += theme.fg("accent", String(args?.action ?? "?"));
       if (args?.member) content += " " + theme.fg("muted", String(args.member));
+      if (args?.batch_id) content += " " + theme.fg("dim", `[batch ${String(args.batch_id)}]`);
+      if (args?.expected_members) content += " " + theme.fg("muted", args.expected_members.join(" "));
       if (args?.role) content += " " + theme.fg("accent", `(${String(args.role)})`);
       if (args?.worktree) content += " " + theme.fg("dim", "[worktree]");
       if (args?.task) {

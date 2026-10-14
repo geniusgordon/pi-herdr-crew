@@ -57,6 +57,8 @@ export type Member = {
 export type Pending = {
   taskId: string;
   turn: number;
+  /** Explicit parent batch; never inherited by a different owner session. */
+  batchId?: string;
   /** Transcript turn count before the task was sent, so collect finds the new turn. */
   baseline: number;
   /** Absolute result path, or undefined for an inline task. */

@@ -1,4 +1,5 @@
 node_modules
+.crew-test-*/
 !.pi/
 .pi/*
 !.pi/crew/
